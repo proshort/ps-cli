@@ -31,9 +31,14 @@ import re
 import sys
 from typing import Any
 
-# C0 controls except tab, plus DEL and the C1 block. Tab survives because it is a
-# legitimate separator and a terminal does not act on it beyond advancing.
+# C0 controls, DEL and the C1 block. Tab and newline are handled separately by
+# the two entry points below, because they are a different kind of problem: an
+# escape sequence makes the terminal *act*, while a newline or a tab forges
+# *structure*. Both matter and they do not have the same fix.
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+# Newline and tab. Stripped only where the output has one line per record.
+_LAYOUT = re.compile(r"[\t\n\r\x0b\x0c\u2028\u2029]+")
 
 # ANSI escape sequences: CSI (cursor movement, colour, erase), OSC (window title,
 # hyperlinks -- terminated by BEL or ST), and the short two-character forms.
@@ -45,23 +50,53 @@ _ANSI = re.compile(
 
 
 def sanitize(value: str) -> str:
-    """Make one string safe to print. Escapes first, then stray controls.
+    """Make one string safe to *print*. Escapes first, then stray controls.
 
-    Order matters: stripping the lone `\\x1b` first would leave `[2K` behind as
-    literal text, which is harmless but wrong, and would break the sequence match
-    so a longer OSC payload survived as visible garbage.
+    Order matters: stripping the lone `\x1b` first would leave `[2K` behind as
+    literal text, and would break the sequence match so a longer OSC payload
+    survived as visible garbage.
+
+    Newline and tab survive here, because this is the prose form -- a call recap
+    or a deal summary keeps its paragraphs. Anywhere the output is one line per
+    record, use `sanitize_line`.
     """
     return _CONTROL.sub("", _ANSI.sub("", value))
 
 
+def sanitize_line(value: str) -> str:
+    """`sanitize`, plus anything that would forge a line or a column.
+
+    A terminal acts on what it reads, and that cuts two ways. An escape sequence
+    makes it *do* something -- `sanitize` handles that. A newline or a tab makes
+    it *lay out* something, and in a row-per-record table or a one-line
+    diagnostic that is just as effective: a deal named
+
+        Acme\nFAKE ROW    Closed Won    $2,000,000
+
+    prints as two rows, and the second one is a lie the reader has no way to spot.
+    `\r` was already covered as a C0 control and `\n` was not, which made the
+    protection look present while the more useful character walked through it.
+
+    Collapsed to a single space rather than removed, so the words on either side
+    do not run together into a different word.
+    """
+    return _LAYOUT.sub(" ", sanitize(value)).strip()
+
+
 def sanitize_deep(value: Any) -> Any:
-    """Sanitize every string in a decoded response, for human rendering only."""
+    """Sanitize every string in a decoded response, for human rendering only.
+
+    The prose form, because this also feeds the pretty-printed single-object view
+    where a call recap should keep its paragraphs. Table cells go through
+    `sanitize_line` separately in `_cell`, since a row is one line by definition.
+    """
     if isinstance(value, str):
         return sanitize(value)
     if isinstance(value, list):
         return [sanitize_deep(item) for item in value]
     if isinstance(value, dict):
-        return {sanitize(str(k)): sanitize_deep(v) for k, v in value.items()}
+        # Keys use the line form: a key is a label, never a paragraph.
+        return {sanitize_line(str(k)): sanitize_deep(v) for k, v in value.items()}
     return value
 
 
@@ -79,13 +114,18 @@ def emit_json(payload: Any, *, ndjson_rows: list[Any] | None = None) -> None:
 
 
 def note(message: str) -> None:
-    """Diagnostics go to stderr, always.
+    """Diagnostics go to stderr, always, and are sanitized on the way.
 
-    So `ps deals list --json | jq` works with nothing thrown away and nothing
-    interleaved -- which is the difference between a tool a person uses and a tool
-    a script uses being the same tool.
+    Stderr is a terminal too. Almost everything printed here has passed through
+    the server from somewhere else -- an error message, the list of omitted
+    sections, a deal name inside an exception -- so sanitizing at each call site
+    means sanitizing at every call site, forever, including the ones added later.
+    Doing it here instead makes that impossible to forget.
+
+    `sanitize_line`, not `sanitize`: a diagnostic is one line, and a newline in it
+    would let a CRM field forge a second one that looks like our own output.
     """
-    sys.stderr.write(f"{message}\n")
+    sys.stderr.write(f"{sanitize_line(message)}\n")
 
 
 def emit_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]]) -> None:
@@ -119,5 +159,5 @@ def _cell(value: Any) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, (list, dict)):
-        return sanitize(json.dumps(value, default=str))[:48]
-    return sanitize(str(value))
+        return sanitize_line(json.dumps(value, default=str))[:48]
+    return sanitize_line(str(value))

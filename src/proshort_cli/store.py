@@ -99,7 +99,7 @@ class CredentialStore:
             # signed out; `ps login` will overwrite it.
             return None
 
-    def save(self, credentials: Credentials) -> None:
+    def save(self, credentials: Credentials, *, announce: bool = False) -> None:
         raw = json.dumps(asdict(credentials))
         ring = self._keyring()
         if ring is not None:
@@ -113,12 +113,27 @@ class CredentialStore:
                 pass
 
         self._dir.mkdir(parents=True, exist_ok=True)
-        # Created 0600 *before* anything is written to it. Writing first and
+        # Written to a sibling temp file and renamed, because `os.replace` is
+        # atomic on POSIX. Truncating the real file first leaves a window where a
+        # concurrent `load()` -- and `Client.__init__` does one, outside the lock
+        # -- reads an empty file and reports the user as signed out.
+        #
+        # Created 0600 *before* anything is written to it: writing first and
         # chmod-ing after leaves a window where the token is world-readable.
-        fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(raw)
-        note(f"note: no OS keychain available; credentials are in {self._path} (0600)")
+        tmp = self._path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self._path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+        if announce:
+            # Only when the user asked for something, not on every silent refresh.
+            note(f"note: no OS keychain available; credentials are in {self._path} (0600)")
 
     def clear(self) -> None:
         ring = self._keyring()

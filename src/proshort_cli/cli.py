@@ -7,7 +7,9 @@ reading a table and a script running `| jq`, without a flag and without
 """
 
 import argparse
+import os
 import sys
+from urllib.parse import quote
 import time
 
 from proshort_cli import oauth, render
@@ -16,7 +18,11 @@ from proshort_cli.errors import CliError, EXIT_OK, EXIT_USAGE
 from proshort_cli.render import emit_json, emit_table, note
 from proshort_cli.store import CredentialStore, Credentials
 
-DEFAULT_BASE_URL = "https://ps-mcp-prod-apps.internal.proshort.ai"
+# Deliberately no default. The previous one was `*.internal.proshort.ai`, which a
+# customer's machine cannot resolve at all -- so the first `proshort login` failed
+# with "Proshort is unavailable", which is both wrong and the hardest possible
+# thing to diagnose from the outside. An explicit value, or a clear refusal.
+BASE_URL_ENV = "PROSHORT_URL"
 
 SCOPES = [
     "profile:read",
@@ -50,6 +56,14 @@ def _repeat(values, name):
 def cmd_login(args) -> int:
     store = CredentialStore(args.profile)
     existing = store.load()
+    if args.scope and args.add_scope:
+        # --add-scope used to overwrite --scope entirely, so one of the two the
+        # user typed was silently dropped. Refused rather than guessed at.
+        raise CliError(
+            "--scope and --add-scope do the same job from opposite ends; pass one.",
+            EXIT_USAGE,
+            hint="--scope replaces the whole set; --add-scope widens what you already have.",
+        )
     scopes = list(SCOPES)
     if args.scope:
         scopes = [s.strip() for s in args.scope.split(",") if s.strip()]
@@ -61,7 +75,18 @@ def cmd_login(args) -> int:
     if unknown:
         raise CliError(f"unknown permission(s): {', '.join(unknown)}", EXIT_USAGE)
 
-    base_url = (args.url or (existing.base_url if existing else None) or DEFAULT_BASE_URL).rstrip("/")
+    base_url = (
+        args.url
+        or os.environ.get(BASE_URL_ENV)
+        or (existing.base_url if existing else None)
+    )
+    if not base_url:
+        raise CliError(
+            "No Proshort API address configured.",
+            EXIT_USAGE,
+            hint=f"Pass --url https://<your-proshort-host>, or set {BASE_URL_ENV}.",
+        )
+    base_url = base_url.rstrip("/")
     payload = oauth.login(
         base_url=base_url,
         client_id=args.client_id,
@@ -70,24 +95,56 @@ def cmd_login(args) -> int:
     )
     granted = (payload.get("scope") or " ".join(scopes)).split()
     store.save(
-        Credentials(
+        announce=True,
+        credentials=Credentials(
             access_token=payload["access_token"],
             refresh_token=payload["refresh_token"],
             expires_at=time.time() + int(payload.get("expires_in", 600)),
             scopes=granted,
             base_url=base_url,
             client_id=args.client_id,
-        )
+        ),
     )
-    who = Client(store).get("/v1/me").get("data", {})
-    name = render.sanitize(str(who.get("display_name") or "your account"))
-    note(f"✓ signed in as {name} · {len(granted)} permissions")
+
+    # The grant is real and stored from here on. Naming the user is a courtesy,
+    # so a failure past this point must not look like a failed sign-in -- which
+    # it did when `--scope` omitted `profile:read`, or when /v1/me was briefly
+    # down: the user saw exit 4 or 6 and reasonably concluded they were not
+    # signed in, while working credentials sat on disk.
+    name = "your account"
+    try:
+        who = Client(store).get("/v1/me").get("data", {})
+        name = str(who.get("display_name") or name)
+    except CliError:
+        pass
+    note(f"\u2713 signed in as {name} \u00b7 {len(granted)} permissions")
     return EXIT_OK
 
 
 def cmd_logout(args) -> int:
-    CredentialStore(args.profile).clear()
-    note("✓ signed out")
+    """Revoke server-side first, then forget locally.
+
+    Clearing the file alone left a refresh token valid for thirty days, so "I
+    logged out" was not true of anything except this machine's copy.
+    """
+    store = CredentialStore(args.profile)
+    existing = store.load()
+    revoked = False
+    if existing is not None:
+        try:
+            oauth.revoke(
+                base_url=existing.base_url,
+                client_id=existing.client_id,
+                token=existing.refresh_token,
+            )
+            revoked = True
+        except Exception:  # noqa: BLE001 - never block the local clear
+            pass
+    store.clear()
+    if existing is not None and not revoked:
+        note("\u2713 signed out locally \u2014 could not reach Proshort to revoke the session")
+    else:
+        note("\u2713 signed out")
     return EXIT_OK
 
 
@@ -112,7 +169,10 @@ def cmd_deals_list(args) -> int:
 
 
 def cmd_deals_get(args) -> int:
-    body = _client(args).get(f"/v1/deals/{args.deal_id}")
+    # Encoded, not interpolated. A `/` or a `..` in an id would otherwise be a
+    # different request than the one the user typed -- the server validates the
+    # id too, but composing the path is this function's job.
+    body = _client(args).get(f"/v1/deals/{quote(args.deal_id, safe='')}")
     return _emit(args, body, table=None, single=True)
 
 
@@ -226,14 +286,17 @@ def _add_global_flags(parser: argparse.ArgumentParser, *, top: bool) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="ps", description="Your own Proshort sales data.")
+    parser = argparse.ArgumentParser(
+        prog=os.path.basename(sys.argv[0]) or "proshort",
+        description="Your own Proshort sales data.",
+    )
     _add_global_flags(parser, top=True)
     common = argparse.ArgumentParser(add_help=False)
     _add_global_flags(common, top=False)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("login", help="Sign in through your browser.", parents=[common])
-    p.add_argument("--url", help=f"Proshort API base URL (default {DEFAULT_BASE_URL}).")
+    p.add_argument("--url", help=f"Proshort API base URL. Or set {BASE_URL_ENV}.")
     p.add_argument("--client-id", default=oauth.DEFAULT_CLIENT_ID)
     p.add_argument("--scope", help="Comma-separated permissions to request.")
     p.add_argument("--add-scope", help="Add one permission to what you already granted.")

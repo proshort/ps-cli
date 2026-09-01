@@ -4,9 +4,9 @@ Command-line access to **your own** Proshort sales data — deals, calls, meetin
 — and the base the Claude Skills in [`skills/`](skills/) are built on.
 
 ```bash
-ps login
-ps deals list --type ACTIVE --limit 5
-ps deals list --type ACTIVE --all --json | jq -r '.data[].deal_id'
+proshort login --url https://<your-proshort-host>
+proshort deals list --type ACTIVE --limit 5
+proshort deals list --type ACTIVE --all --json | jq -r '.data[].deal_id'
 ```
 
 ## Install
@@ -15,36 +15,57 @@ ps deals list --type ACTIVE --all --json | jq -r '.data[].deal_id'
 uv tool install proshort-cli            # or: pipx install proshort-cli
 ```
 
-The OS keychain is used when one is available. Without it (a container, a CI
-runner) credentials go to `~/.proshort/<profile>.json` at mode `0600`, and the
-CLI says so on the way past.
+**macOS and Linux only in 0.1.0.** The refresh lock uses `fcntl`, so importing
+this on Windows fails. A port needs `msvcrt.locking` behind the same interface -
+not a large change, just not this one.
+
+The command is `proshort`. There is deliberately no `ps` alias: it would shadow
+the POSIX process tool on `PATH`, and `ps aux` quietly becoming this program is a
+memorably bad afternoon.
+
+Credentials go to the OS keychain - `keyring` is a hard dependency, not an extra,
+so the sentence above is true of a default install. On a machine with no keyring
+backend (a container, a CI runner) they fall back to
+`~/.proshort/<profile>.json` at mode `0600`, and `login` says so.
 
 ## Signing in
 
-`ps login` opens your browser, you sign in to Proshort the normal way, and you
+There is no default API address: pass `--url` once, or set `PROSHORT_URL`. It is
+remembered per profile afterwards. (The previous default was an internal
+hostname a customer's machine cannot resolve, which failed as "Proshort is
+unavailable" - true of nothing, and the hardest possible thing to diagnose.)
+
+`proshort login` opens your browser, you sign in to Proshort the normal way, and you
 approve what's being shared. The browser comes back to a listener this process
 binds on `127.0.0.1` with a one-time code good for 60 seconds, which is exchanged
 for tokens. **You never see or handle a token.**
 
 The access token lasts 10 minutes and is refreshed silently; the grant lasts 30
-days. After that, or if an administrator revokes access, `ps login` again.
+days. After that, or if an administrator revokes access, sign in again.
 
-Permissions are requested once, at login:
+`proshort logout` revokes the grant server-side (RFC 7009) and *then* forgets it
+locally, so a copied credential file stops working too. If the server cannot be
+reached it still clears locally and tells you it could not revoke.
+
+Permissions are requested once, at login. Passing both of these at once is
+refused rather than one being silently dropped:
 
 ```bash
-ps login --scope deals:read,recordings:read     # narrower than the default
-ps login --add-scope reps:read                  # widen later
+proshort login --scope deals:read,recordings:read   # narrower than the default
+proshort login --add-scope reps:read                # widen later
 ```
 
 ## Output
 
 **A table when you're watching, JSON the moment it's piped.** Data goes to
-stdout, everything else to stderr, so `ps deals list --json | jq` works with
-nothing thrown away.
+stdout, everything else to stderr, so `proshort deals list --json | jq` works
+with nothing thrown away.
 
 - `--json` forces JSON even on a terminal
 - `--ndjson` gives one object per line, for `while read` and large result sets
-- `--all` follows pages up to the server's cap
+- `--all` follows pages until a short page ends the walk. **It never returns a
+  partial result quietly**: any error mid-scan fails the whole command, because a
+  short list that looks complete is worse than a visible failure
 
 ## Exit codes
 
@@ -56,8 +77,8 @@ number, never on the message.
 | 0 | Success |
 | 1 | Anything else |
 | 2 | Usage error |
-| 3 | Not signed in → `ps login` |
-| 4 | Missing a permission → `ps login --add-scope <scope>` |
+| 3 | Not signed in -> `proshort login` |
+| 4 | Missing a permission -> `proshort login --add-scope <scope>` |
 | 5 | Rate limited for longer than `--timeout` |
 | 6 | Proshort is unavailable |
 
@@ -67,9 +88,11 @@ number, never on the message.
 call summaries are written by people outside your organization — a prospect picks
 their own company name. `render.py` strips terminal escape sequences from
 anything printed for a human, because a terminal acts on what it reads and a deal
-name can otherwise erase the row above it. `--json` output is *not* stripped: the
-JSON encoder escapes it losslessly, and a script must receive what the server
-actually sent.
+name can otherwise erase the row above it. Anywhere the output is one line per
+record - table cells, and every diagnostic - newlines and tabs go too, since a
+name containing one can otherwise forge a whole extra row that the reader has no
+way to spot. `--json` output is *not* stripped: the JSON encoder escapes it
+losslessly, and a script must receive what the server actually sent.
 
 **Two commands at once won't sign you out.** The server rotates refresh tokens
 and treats re-use of a spent one as theft — correct against a stolen token, and

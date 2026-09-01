@@ -8,8 +8,8 @@ the interface and the message is for the human.
     0  success
     1  anything else
     2  usage error
-    3  not authenticated              -> run `ps login`
-    4  insufficient scope             -> run `ps login --add-scope <scope>`
+    3  not authenticated              -> run `proshort login`
+    4  insufficient scope             -> run `proshort login --add-scope <scope>`
     5  rate limited beyond --timeout
     6  Proshort is unavailable
 """
@@ -34,12 +34,12 @@ class CliError(Exception):
 
 class NotAuthenticated(CliError):
     def __init__(self, message: str = "Not signed in.") -> None:
-        super().__init__(message, EXIT_AUTH, hint="Run: ps login")
+        super().__init__(message, EXIT_AUTH, hint="Run: proshort login")
 
 
 class InsufficientScope(CliError):
     def __init__(self, scope: str | None) -> None:
-        hint = f"Run: ps login --add-scope {scope}" if scope else "Run: ps login"
+        hint = f"Run: proshort login --add-scope {scope}" if scope else "Run: proshort login"
         super().__init__(
             f"This session was not granted {scope}." if scope else "Missing a required permission.",
             EXIT_SCOPE,

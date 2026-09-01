@@ -15,17 +15,23 @@ Three details are load-bearing:
   CLI would faithfully redeem it -- leaving the user signed in as somebody else
   and reading a stranger's pipeline believing it is theirs. PKCE does not cover
   this; it binds the code to the client, not the session to the user.
-- **A self-contained callback page.** No external references of any kind, and
-  `Referrer-Policy: no-referrer`, so the authorization code in our URL cannot be
-  carried anywhere by a subresource fetch.
+- **A self-contained callback page.** No external references of any kind, plus
+  `Referrer-Policy: no-referrer` and a `default-src 'none'` CSP, so the
+  authorization code in our URL cannot be carried anywhere by a subresource
+  fetch -- enforced by a header rather than asserted by a comment.
+
+The listener keeps serving until it gets a callback that belongs to *this* flow.
+An earlier version handled exactly one request, which meant any GET to the port
+during the wait -- a favicon probe, a health checker, an `<img src>` on a page the
+user happens to have open -- consumed the listener and turned the sign-in into a
+misleading "timed out". A request that is not ours is answered and ignored.
 """
 
 import base64
 import hashlib
 import http.server
 import secrets
-import socket
-import threading
+import time
 import urllib.parse
 import webbrowser
 
@@ -52,31 +58,59 @@ def _pkce() -> tuple[str, str]:
 
 
 class _Catcher(http.server.BaseHTTPRequestHandler):
-    """Catches exactly one callback and stops."""
+    """Answers callbacks. Stores only one that belongs to this flow."""
 
+    expected_state: str = ""
     result: dict[str, str] = {}
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's interface
+        # Loopback only. The redirect is registered as 127.0.0.1, so a request
+        # arriving under any other Host reached us some other way and has no
+        # business being answered with a page that carries a code.
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            self._reply(400, b"Bad host", b"")
+            return
+
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path != CALLBACK_PATH:
-            self.send_response(404)
-            self.end_headers()
+            # Something else on this machine poked the port. Answer it and keep
+            # listening -- this used to end the sign-in.
+            self._reply(404, b"Not found", b"")
             return
+
         query = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
-        type(self).result = query
+
+        # `state` is checked *here*, before anything in the response is read --
+        # including `error`. Checking it later meant a forged
+        # `?error=access_denied` could end a sign-in without ever being matched
+        # against the flow that started it.
+        if not secrets.compare_digest(query.get("state", ""), _Catcher.expected_state):
+            self._reply(
+                400,
+                b"That didn&rsquo;t match.",
+                b"This response did not belong to the sign-in your terminal started.",
+            )
+            return
+
+        _Catcher.result = query
         ok = "code" in query
-        body = _PAGE % (
+        self._reply(
+            200,
             b"You&rsquo;re signed in." if ok else b"Sign-in failed.",
             b"You can close this tab and go back to your terminal."
             if ok
             else b"Go back to your terminal for the details.",
         )
-        self.send_response(200)
+
+    def _reply(self, status: int, heading: bytes, detail: bytes) -> None:
+        body = _PAGE % (heading, detail)
+        self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         # The authorization code is in this page's URL. Nothing here loads a
-        # subresource, and this makes sure nothing can carry the code outward if
-        # that ever changes.
+        # subresource, and these two make that a guarantee rather than a promise.
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -84,12 +118,6 @@ class _Catcher(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *_args) -> None:
         """Silence. The default logs the request line -- which contains the code."""
-
-
-def _free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
 
 
 def login(
@@ -104,14 +132,14 @@ def login(
     base_url = base_url.rstrip("/")
     verifier, challenge = _pkce()
     state = secrets.token_urlsafe(24)
-    port = _free_port()
-    redirect_uri = f"http://127.0.0.1:{port}{CALLBACK_PATH}"
 
+    # Bound to port 0 and read back, rather than probing for a free port and
+    # rebinding it: between the probe and the rebind another process can take it.
+    _Catcher.expected_state = state
     _Catcher.result = {}
-    server = http.server.HTTPServer(("127.0.0.1", port), _Catcher)
-    server.timeout = timeout
-    thread = threading.Thread(target=server.handle_request, daemon=True)
-    thread.start()
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Catcher)
+    port = int(server.server_address[1])
+    redirect_uri = f"http://127.0.0.1:{port}{CALLBACK_PATH}"
 
     params = {
         "response_type": "code",
@@ -125,31 +153,27 @@ def login(
         params["scope"] = " ".join(scopes)
     authorize_url = f"{base_url}/authorize?{urllib.parse.urlencode(params)}"
 
-    note(f"→ opened your browser · listening on 127.0.0.1:{port}")
+    note(f"\u2192 opened your browser \u00b7 listening on 127.0.0.1:{port}")
     if open_browser:
         webbrowser.open(authorize_url)
     else:
         note(f"  open this to continue:\n  {authorize_url}")
 
-    thread.join(timeout)
-    server.server_close()
-    result = _Catcher.result
-    _Catcher.result = {}
+    try:
+        result = _serve_until_callback(server, timeout)
+    finally:
+        server.server_close()
+        _Catcher.expected_state = ""
+        _Catcher.result = {}
 
     if not result:
         raise CliError("Timed out waiting for the browser to come back.", EXIT_AUTH)
+    # `state` was verified in the handler before this dict was stored. Re-checked
+    # here so the guarantee does not depend on reading another function.
+    if not secrets.compare_digest(result.get("state", ""), state):
+        raise CliError("The sign-in response did not match this session.", EXIT_AUTH)
     if "error" in result:
         raise CliError(f"Sign-in was refused: {result.get('error')}", EXIT_AUTH)
-
-    # Compared before the code is used for anything at all. A mismatch means this
-    # callback did not belong to the flow we started, and the only safe response
-    # is to throw the code away unredeemed.
-    if not secrets.compare_digest(result.get("state", ""), state):
-        raise CliError(
-            "The sign-in response did not match the request this session started, "
-            "so it was discarded. Try again.",
-            EXIT_AUTH,
-        )
     if "code" not in result:
         raise CliError("The browser came back without an authorization code.", EXIT_AUTH)
 
@@ -160,6 +184,20 @@ def login(
         verifier=verifier,
         redirect_uri=redirect_uri,
     )
+
+
+def _serve_until_callback(server: http.server.HTTPServer, timeout: int) -> dict[str, str]:
+    """Serve requests until one is ours, or the deadline passes.
+
+    `handle_request` services exactly one request, so calling it once meant the
+    first stray GET to the port ended the sign-in. The short per-call timeout is
+    what lets the deadline be checked between requests.
+    """
+    deadline = time.monotonic() + timeout
+    server.timeout = 1.0
+    while not _Catcher.result and time.monotonic() < deadline:
+        server.handle_request()
+    return dict(_Catcher.result)
 
 
 def exchange_code(
@@ -178,7 +216,7 @@ def exchange_code(
     )
     if response.status_code != 200:
         raise CliError(f"Could not complete sign-in ({response.status_code}).", EXIT_AUTH)
-    return response.json()
+    return _token_payload(response, "sign-in")
 
 
 def refresh(*, base_url: str, client_id: str, refresh_token: str) -> dict:
@@ -192,5 +230,56 @@ def refresh(*, base_url: str, client_id: str, refresh_token: str) -> dict:
         timeout=30,
     )
     if response.status_code != 200:
-        raise CliError("Your session has ended.", EXIT_AUTH, hint="Run: ps login")
-    return response.json()
+        raise CliError("Your session has ended.", EXIT_AUTH, hint="Run: proshort login")
+    return _token_payload(response, "refresh")
+
+
+def _token_payload(response: "httpx.Response", what: str) -> dict:
+    """Validate a token response before anything indexes into it.
+
+    `response.json()` returns whatever the other end sent. Treating that as a dict
+    with the keys we want turns a malformed or unexpected body into a `KeyError`
+    or an `AttributeError` -- which escapes `main()` as a traceback and exit 1,
+    breaking the exit-code contract at exactly the moment a script most needs it.
+    """
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise CliError(f"Could not read the {what} response.", EXIT_AUTH) from exc
+    if not isinstance(payload, dict):
+        raise CliError(f"The {what} response was not in the expected form.", EXIT_AUTH)
+    for required in ("access_token", "refresh_token"):
+        if not isinstance(payload.get(required), str):
+            raise CliError(
+                f"The {what} response was missing {required}.", EXIT_AUTH
+            )
+    return payload
+
+
+def revoke(*, base_url: str, client_id: str, token: str) -> None:
+    """Best-effort RFC 7009 revocation.
+
+    `ps-mcp` enables the revocation endpoint and revokes the whole refresh family
+    from either half of the pair, so this actually ends the grant rather than
+    just forgetting it locally. Without it, "I logged out" leaves a token that
+    keeps working for thirty days -- which is exactly what somebody who copied
+    the credential file is counting on.
+
+    Best-effort on purpose: a network failure must not stop the local credentials
+    being cleared. The caller reports what happened.
+    """
+    httpx.post(
+        f"{base_url.rstrip('/')}/revoke",
+        data={
+            "token": token,
+            "token_type_hint": "refresh_token",
+            "client_id": client_id,
+            # Required by the server's request model even though this is a public
+            # client with no secret. Sent empty rather than omitted: client
+            # authentication for `token_endpoint_auth_method="none"` ignores the
+            # value entirely, but the field has to be present or the request is
+            # rejected as malformed before it reaches revocation at all.
+            "client_secret": "",
+        },
+        timeout=15,
+    ).raise_for_status()

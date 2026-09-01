@@ -1,0 +1,28 @@
+name: ci
+
+# A credential-handling tool customers install. The tests assert things like "a
+# hostile deal name cannot repaint the terminal" and "a mismatched state is never
+# redeemed" -- properties that are worth nothing if nobody notices them breaking.
+on:
+  pull_request:
+  push:
+    branches: [main, staging]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both supported platforms, because the refresh lock is POSIX-specific
+        # and the credential file's permissions are checked by a real stat().
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q
+      - run: python -m ruff check src tests

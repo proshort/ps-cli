@@ -2,20 +2,44 @@
 name = "proshort-cli"
 version = "0.1.0"
 description = "Command-line access to your own Proshort sales data."
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "UNLICENSED" }
 dependencies = [
     "httpx>=0.27",
+    # A hard dependency, not an extra. The README says the OS keychain is used
+    # when one is available, and an extra nobody installs made that false for
+    # every default install -- every user silently landed on the 0600 file. The
+    # library already degrades on a machine with no backend, and `store.py`
+    # catches that, so making it required costs nothing and makes the claim true.
+    "keyring>=25",
 ]
 
+# POSIX only in 0.1.0: `store.py` imports `fcntl` at module scope for the refresh
+# lock, so importing anything on Windows fails. Declared rather than discovered
+# in a customer ticket. A Windows port needs `msvcrt.locking` behind the same
+# interface -- not a large change, just not this change.
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Private :: Do Not Upload",
+]
+
+[project.urls]
+Source = "https://github.com/proshort/ps-cli"
+
 [project.optional-dependencies]
-# The OS keychain. Optional so the CLI installs and works on a machine with no
-# keyring backend (a container, a CI runner); `store.py` falls back to a 0600
-# file and says so.
-keyring = ["keyring>=25"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
-ps = "proshort_cli.cli:main"
+# `proshort` only, deliberately. `ps` collides with the POSIX process tool, and
+# `uv tool install` puts its shim first on PATH -- so installing this would break
+# `ps aux` in that shell, which is a spectacularly confusing thing to debug.
+# Adding an alias later is cheap; removing one after Skills have been written
+# against it is not, so 0.1.0 ships the name we can keep.
 proshort = "proshort_cli.cli:main"
 
 [build-system]
@@ -30,3 +54,6 @@ line-length = 110
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# So `pytest` works from a clean checkout without an editable install, which is
+# what "tests need no network and no server" ought to mean.
+pythonpath = ["src"]

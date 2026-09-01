@@ -103,3 +103,30 @@ def test_saving_to_the_keychain_removes_any_earlier_file_copy(tmp_path, monkeypa
     store.save(_creds(access_token="psmcp_at_new"))
     assert not store.path.exists(), "the token must not survive on disk once the keychain has it"
     assert json.loads(ring.stored["test"])["access_token"] == "psmcp_at_new"
+
+
+def test_the_credential_write_is_atomic(tmp_path, monkeypatch):
+    """A reader must never see a half-written or empty file.
+
+    `Client.__init__` calls `load()` outside the refresh lock, so a truncate-then-write
+    left a window where a concurrent command read an empty file and reported the
+    user as signed out.
+    """
+    store = _store(tmp_path, monkeypatch)
+    store.save(_creds(access_token="psmcp_at_first"))
+
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def watched(src, dst):
+        # At the moment of the rename the destination still holds the old,
+        # complete value -- never an empty or partial one.
+        seen.append(open(dst, encoding="utf-8").read())
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", watched)
+    store.save(_creds(access_token="psmcp_at_second"))
+
+    assert seen and "psmcp_at_first" in seen[0]
+    assert store.load().access_token == "psmcp_at_second"
+    assert not list(tmp_path.glob("*.tmp")), "the temp file must not survive"
