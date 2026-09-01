@@ -1,0 +1,32 @@
+[project]
+name = "proshort-cli"
+version = "0.1.0"
+description = "Command-line access to your own Proshort sales data."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# The OS keychain. Optional so the CLI installs and works on a machine with no
+# keyring backend (a container, a CI runner); `store.py` falls back to a 0600
+# file and says so.
+keyring = ["keyring>=25"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[project.scripts]
+ps = "proshort_cli.cli:main"
+proshort = "proshort_cli.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
