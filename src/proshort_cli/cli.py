@@ -13,7 +13,7 @@ import time
 from contextlib import suppress
 from urllib.parse import quote
 
-from proshort_cli import oauth, render
+from proshort_cli import __version__, oauth, render
 from proshort_cli.api import Client
 from proshort_cli.errors import EXIT_OK, EXIT_USAGE, CliError
 from proshort_cli.render import emit_json, emit_table, note
@@ -88,12 +88,33 @@ def cmd_login(args) -> int:
             hint=f"Pass --url https://<your-proshort-host>, or set {BASE_URL_ENV}.",
         )
     base_url = base_url.rstrip("/")
+    # Checked here, before the browser opens, so a bad address is a usage error
+    # rather than a failed sign-in the user has to interpret.
+    oauth.require_secure(base_url)
     payload = oauth.login(
         base_url=base_url,
         client_id=args.client_id,
         scopes=scopes,
+        timeout=args.timeout or LOGIN_TIMEOUT,
         open_browser=not args.no_browser,
     )
+    # The new grant exists, so the old one is now a second live credential for
+    # the same person that nobody will ever use again -- and `logout` was the
+    # only thing that ever killed one. Signing in twice therefore left a
+    # thirty-day refresh token behind every time, which is precisely what
+    # somebody who copied the credentials file is counting on.
+    #
+    # Revoked *after* the exchange, never before: a sign-in that fails partway
+    # must leave the user with the session they already had. Different families,
+    # so this cannot touch the grant just issued. Best-effort, like `logout`.
+    if existing is not None:
+        with suppress(Exception):
+            oauth.revoke(
+                base_url=existing.base_url,
+                client_id=existing.client_id,
+                token=existing.refresh_token,
+            )
+
     granted = (payload.get("scope") or " ".join(scopes)).split()
     store.save(
         announce=True,
@@ -151,7 +172,9 @@ def cmd_logout(args) -> int:
 
 
 def cmd_whoami(args) -> int:
-    body = Client(CredentialStore(args.profile), timeout=args.timeout).get("/v1/me")
+    body = Client(
+        CredentialStore(args.profile), timeout=args.timeout or DEFAULT_TIMEOUT
+    ).get("/v1/me")
     return _emit(args, body, table=None, single=True)
 
 
@@ -225,8 +248,16 @@ def cmd_meetings(args) -> int:
 # ----------------------------------------------------------------------- shared
 
 
+DEFAULT_TIMEOUT = 60
+LOGIN_TIMEOUT = 300
+
+
 def _client(args) -> Client:
-    return Client(CredentialStore(args.profile), timeout=args.timeout, verbose=args.verbose)
+    return Client(
+        CredentialStore(args.profile),
+        timeout=args.timeout or DEFAULT_TIMEOUT,
+        verbose=args.verbose,
+    )
 
 
 def _emit(args, body, *, table: str | None, single: bool = False) -> int:
@@ -260,14 +291,14 @@ def _emit(args, body, *, table: str | None, single: bool = False) -> int:
 def _add_global_flags(parser: argparse.ArgumentParser, *, top: bool) -> None:
     """The flags that mean the same thing wherever they appear.
 
-    Added to the top-level parser *and* to every subparser, because `ps whoami
-    --json` is what a person actually types and argparse otherwise only accepts
-    `ps --json whoami`.
+    Added to the top-level parser *and* to every subparser, because `proshort
+    whoami --json` is what a person actually types and argparse otherwise only
+    accepts `proshort --json whoami`.
 
     The subparser copies default to `SUPPRESS`, which is what makes that safe: an
     absent flag leaves the attribute unset rather than writing a default over the
     value the top-level parser already put in the namespace. Without it, adding
-    these to the subparsers would silently break `ps --json whoami` -- the
+    these to the subparsers would silently break `proshort --json whoami` -- the
     subparser's `False` would land on top of the top-level `True`.
     """
     default = (lambda value: value) if top else (lambda _value: argparse.SUPPRESS)
@@ -279,8 +310,16 @@ def _add_global_flags(parser: argparse.ArgumentParser, *, top: bool) -> None:
     parser.add_argument(
         "--ndjson", action="store_true", default=default(False), help="One JSON object per line."
     )
+    # `None` rather than `60`, so a subcommand can tell "not given" from "given
+    # 60" and pick its own default. `login` waits on a human opening a browser
+    # and needs minutes; everything else is a handful of requests. Without this
+    # the flag was accepted on `login` and silently ignored, which is worse than
+    # not offering it.
     parser.add_argument(
-        "--timeout", type=int, default=default(60), help="Seconds to spend, including waits."
+        "--timeout",
+        type=int,
+        default=default(None),
+        help="Seconds to spend, including waits (default: 60; 300 for login).",
     )
     parser.add_argument(
         "--verbose", action="store_true", default=default(False), help="Diagnostics on stderr."
@@ -292,6 +331,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog=os.path.basename(sys.argv[0]) or "proshort",
         description="Your own Proshort sales data.",
     )
+    # The first thing support asks for. Read from the installed metadata rather
+    # than a second constant, so it cannot disagree with what was installed.
+    parser.add_argument("--version", action="version", version=f"proshort {__version__}")
     _add_global_flags(parser, top=True)
     common = argparse.ArgumentParser(add_help=False)
     _add_global_flags(common, top=False)
@@ -330,7 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_activities)
 
     p = sub.add_parser("reps", parents=[common], help="Per-rep performance.")
-    p.add_argument("--duration", required=True, help="Window; see `ps filters`.")
+    p.add_argument("--duration", required=True, help="Window; see `proshort filters`.")
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(func=cmd_reps)
 

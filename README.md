@@ -12,8 +12,14 @@ proshort deals list --type ACTIVE --all --json | jq -r '.data[].deal_id'
 ## Install
 
 ```bash
-uv tool install proshort-cli            # or: pipx install proshort-cli
+uv tool install git+https://github.com/proshort/ps-cli
+# or: pipx install git+https://github.com/proshort/ps-cli
 ```
+
+**Not on PyPI, and deliberately not yet.** `pyproject.toml` carries
+`Private :: Do Not Upload` and `UNLICENSED`, so `uv tool install proshort-cli`
+resolves to nothing. Install from the repository until distribution is decided;
+the name is reserved by nobody and the line above is the one that works today.
 
 **macOS and Linux only in 0.1.0.** The refresh lock uses `fcntl`, so importing
 this on Windows fails. A port needs `msvcrt.locking` behind the same interface -
@@ -63,9 +69,16 @@ with nothing thrown away.
 
 - `--json` forces JSON even on a terminal
 - `--ndjson` gives one object per line, for `while read` and large result sets
-- `--all` follows pages until a short page ends the walk. **It never returns a
-  partial result quietly**: any error mid-scan fails the whole command, because a
-  short list that looks complete is worse than a visible failure
+- `--all` follows pages until a short page ends the walk, and exists only on
+  `deals list` and `recordings` — the two endpoints that page. **It never returns
+  a partial result quietly**: any error mid-scan fails the whole command, because
+  a short list that looks complete is worse than a visible failure. It also stops
+  at a page ceiling rather than following a server that never ends
+- `--timeout` is a budget for the **whole command**, waits included, not for each
+  request — so `--all` over many pages cannot quietly spend a multiple of it
+- Redirecting to a file is a pipe, so `proshort deals list > out.txt` writes JSON,
+  not the table. That is the rule working as intended; pass `--json` explicitly if
+  you want it to be obvious in the command
 
 ## Exit codes
 

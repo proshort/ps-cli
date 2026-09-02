@@ -12,6 +12,7 @@ import pytest
 from proshort_cli import api
 from proshort_cli.api import Client
 from proshort_cli.errors import (
+    EXIT_AUTH,
     EXIT_ERROR,
     EXIT_RATE_LIMIT,
     EXIT_UNAVAILABLE,
@@ -38,8 +39,8 @@ def _creds(**over) -> Credentials:
 @pytest.fixture
 def client(tmp_path, monkeypatch) -> Client:
     monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: None)
     store = CredentialStore("test")
-    monkeypatch.setattr(store, "_keyring", lambda: None)
     store.save(_creds())
     return Client(store, timeout=5)
 
@@ -53,15 +54,33 @@ def _response(status: int, payload=None, headers=None) -> httpx.Response:
     )
 
 
+class _Streamed:
+    """Stands in for `httpx.stream`'s context manager.
+
+    The client streams and abandons a body past its ceiling rather than checking
+    the size of one it has already downloaded, so the stub has to be a context
+    manager over a response, not a return value.
+    """
+
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+
+    def __enter__(self) -> httpx.Response:
+        return self._response
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+
 def _queue(monkeypatch, responses: list[httpx.Response]) -> list[dict]:
     """Serve `responses` in order, recording the params each call was made with."""
     seen: list[dict] = []
 
-    def fake_get(url, **kwargs):
+    def fake_stream(_method, _url, **kwargs):
         seen.append(dict(kwargs.get("params") or []))
-        return responses.pop(0)
+        return _Streamed(responses.pop(0))
 
-    monkeypatch.setattr(api.httpx, "get", fake_get)
+    monkeypatch.setattr(api.httpx, "stream", fake_stream)
     return seen
 
 
@@ -134,7 +153,7 @@ def test_an_expired_token_is_refreshed_once_and_the_call_retried(client, monkeyp
     _queue(monkeypatch, [_response(401, {}), _response(200, {"data": []})])
     refreshed: list[str] = []
 
-    def fake_refresh(*, base_url, client_id, refresh_token):
+    def fake_refresh(*, base_url, client_id, refresh_token, **_):
         refreshed.append(refresh_token)
         return {"access_token": "psmcp_at_b", "refresh_token": "psmcp_rt_b", "expires_in": 600}
 
@@ -176,8 +195,8 @@ def test_a_wait_longer_than_the_deadline_gives_up_with_its_own_code(client, monk
 
 def test_a_junk_retry_after_does_not_crash(tmp_path, monkeypatch):
     monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: None)
     store = CredentialStore("t2")
-    monkeypatch.setattr(store, "_keyring", lambda: None)
     store.save(_creds())
     client = Client(store, timeout=120)  # the fallback wait is 30s
     slept: list[float] = []
@@ -277,11 +296,11 @@ def test_an_oversized_body_is_refused(client, monkeypatch):
 def test_the_bearer_header_is_the_only_thing_carrying_identity(client, monkeypatch):
     sent: dict = {}
 
-    def fake_get(url, **kwargs):
+    def fake_stream(_method, _url, **kwargs):
         sent.update(kwargs)
-        return _response(200, {"data": []})
+        return _Streamed(_response(200, {"data": []}))
 
-    monkeypatch.setattr(api.httpx, "get", fake_get)
+    monkeypatch.setattr(api.httpx, "stream", fake_stream)
     client.get("/v1/deals", [("type", "ACTIVE")])
     assert sent["headers"]["Authorization"] == "Bearer psmcp_at_a"
     assert not any(k in dict(sent["params"]) for k in ("user_id", "customer_id", "ps_user_id"))
@@ -295,8 +314,14 @@ def test_logout_clears_locally_even_when_revocation_fails(tmp_path, monkeypatch)
     from proshort_cli import cli
 
     monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    # Patched on the *class*, not on one instance. `cmd_logout` builds its own
+    # `CredentialStore`, and so does the assertion below, so patching an instance
+    # left both of them talking to the developer's real keychain -- which meant
+    # this test read, and then deleted, whatever credentials the person running
+    # it actually had. The assertion passed for the wrong reason, and the cost
+    # was being signed out by the test suite.
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: None)
     store = CredentialStore("default")
-    monkeypatch.setattr(store, "_keyring", lambda: None)
     store.save(_creds())
 
     def boom(**_kwargs):
@@ -306,3 +331,171 @@ def test_logout_clears_locally_even_when_revocation_fails(tmp_path, monkeypatch)
     args = cli.build_parser().parse_args(["logout"])
     assert cli.cmd_logout(args) == 0
     assert CredentialStore("default").load() is None
+
+
+# ------------------------------------------- what a 200 is allowed to contain
+
+
+def test_a_success_body_that_is_not_an_object_does_not_traceback(client, monkeypatch):
+    """The failure path was already careful about this; the success path was not.
+
+    `.get("data")` on a list is an AttributeError, and `json.loads` on a captive
+    portal's HTML is a ValueError. Either escapes `main()` as a traceback and
+    exit 1 -- the exit-code contract breaking at the moment a script most needs
+    it, which is the whole argument for guarding the other path.
+    """
+    _queue(monkeypatch, [_response(200, [{"id": 1}])])
+    with pytest.raises(CliError) as caught:
+        client.get("/v1/deals")
+    assert caught.value.code == EXIT_UNAVAILABLE
+
+
+def test_a_success_body_that_is_not_json_does_not_traceback(client, monkeypatch):
+    _queue(
+        monkeypatch,
+        [
+            httpx.Response(
+                200,
+                content=b"<html>signed in to the wifi?</html>",
+                request=httpx.Request("GET", "https://example.invalid/v1/deals"),
+            )
+        ],
+    )
+    with pytest.raises(CliError) as caught:
+        client.get("/v1/deals")
+    assert caught.value.code == EXIT_UNAVAILABLE
+
+
+def test_a_page_that_is_not_a_list_is_not_counted_as_results(client, monkeypatch):
+    """`extend` on a dict walks its keys, so a shape change downstream would read
+    as a successful scan of the wrong thing."""
+    _queue(monkeypatch, [_response(200, {"data": {"unexpected": "shape"}})])
+    with pytest.raises(CliError) as caught:
+        client.get_all("/v1/deals", [])
+    assert caught.value.code == EXIT_UNAVAILABLE
+
+
+def test_a_junk_page_size_does_not_crash_the_walk(client, monkeypatch):
+    """Every field in `page` comes off the wire, so `int()` on any of them can
+    raise -- mid-scan, where it escapes as a traceback."""
+    _queue(
+        monkeypatch,
+        [
+            _response(200, {"data": [{"id": 1}], "page": {"page_size": "twenty"}}),
+        ],
+    )
+    body = client.get_all("/v1/deals", [])
+    assert [row["id"] for row in body["data"]] == [1]
+
+
+def test_the_walk_stops_rather_than_following_pages_forever(client, monkeypatch):
+    """A short page is the normal terminator, which is a promise about the
+    *server*. A bug or a proxy that always returns a full page turns `--all` into
+    an unbounded loop against a host `--url` chose."""
+    monkeypatch.setattr(api, "MAX_PAGES", 3)
+
+    def endless(_method, _url, **_kwargs):
+        return _Streamed(_response(200, {"data": [{"id": 1}], "page": {"page_size": 1}}))
+
+    monkeypatch.setattr(api.httpx, "stream", endless)
+    with pytest.raises(CliError) as caught:
+        client.get_all("/v1/deals", [])
+    assert caught.value.code == EXIT_UNAVAILABLE
+    assert "3 pages" in str(caught.value)
+
+
+def test_an_oversized_body_is_abandoned_rather_than_downloaded(client, monkeypatch):
+    """`httpx.get` buffers the whole body first, so checking its length afterwards
+    refused to *parse* what had already been pulled into memory. `--url` names the
+    host, so the thing this bounds is a client that would otherwise accept
+    gigabytes from wherever it was pointed.
+    """
+    monkeypatch.setattr(api, "MAX_RESPONSE_BYTES", 64)
+    pulled = 0
+
+    class _Endless:
+        """Duck-typed rather than an `httpx.Response`: constructing one of those
+        eagerly reads the whole body, which is the behaviour under test."""
+
+        status_code = 200
+        headers = httpx.Headers({})
+
+        def iter_bytes(self, chunk_size=None):
+            nonlocal pulled
+            while True:
+                pulled += 32
+                assert pulled < 4096, "the stream was never abandoned"
+                yield b"x" * 32
+
+    monkeypatch.setattr(api.httpx, "stream", lambda *_a, **_k: _Streamed(_Endless()))
+
+    with pytest.raises(CliError) as caught:
+        client.get("/v1/deals")
+    assert caught.value.code == EXIT_UNAVAILABLE
+    assert pulled <= 128, "more was read than the ceiling allows"
+
+
+def test_the_timeout_is_a_budget_for_the_command_not_for_each_request(tmp_path, monkeypatch):
+    """`--timeout` says "seconds to spend, including waits". Per-request, `--all`
+    over twelve pages could spend twelve times the budget and still be inside
+    every individual limit.
+    """
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: None)
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    store = CredentialStore("t3")
+    store.save(_creds())
+    client = Client(store, timeout=1)
+    client._deadline = time.monotonic() - 1  # the budget is already spent
+
+    with pytest.raises(CliError) as caught:
+        client.get("/v1/deals")
+    assert caught.value.code == EXIT_UNAVAILABLE
+
+
+# -------------------------------------------------------------------- re-login
+
+
+def test_signing_in_again_revokes_the_grant_it_replaces(tmp_path, monkeypatch):
+    """`logout` exists so a copied credential file dies in thirty days. Signing in
+    again left the previous refresh token live, which is exactly what somebody who
+    copied the file is counting on.
+    """
+    from proshort_cli import cli
+
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: None)
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    CredentialStore("default").save(_creds(refresh_token="rt_previous"))
+
+    revoked: list[str] = []
+    monkeypatch.setattr(cli.oauth, "revoke", lambda **kw: revoked.append(kw["token"]))
+    monkeypatch.setattr(
+        cli.oauth,
+        "login",
+        lambda **_: {"access_token": "at_new", "refresh_token": "rt_new", "expires_in": 600},
+    )
+    monkeypatch.setattr(cli, "Client", _unavailable_client)
+
+    args = cli.build_parser().parse_args(["login", "--url", "https://example.invalid"])
+    assert cli.cmd_login(args) == 0
+    assert revoked == ["rt_previous"], "the previous grant was left live"
+    assert CredentialStore("default").load().refresh_token == "rt_new"
+
+
+def _unavailable_client(*_a, **_k):
+    """Stand in for the courtesy `whoami` after sign-in, which needs no network."""
+    raise CliError("no network in this test", EXIT_ERROR)
+
+
+def test_a_stored_cleartext_address_asks_for_a_sign_in_not_a_retry(tmp_path, monkeypatch):
+    """A bad `--url` is exit 2 because the user typed it. A bad address inside a
+    stored credential is not something a Skill can fix by rebuilding its command
+    line, and exit 2 tells it to retry forever.
+    """
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: None)
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    store = CredentialStore("t4")
+    store.save(_creds(base_url="http://mcp.example.com"))
+
+    with pytest.raises(CliError) as caught:
+        Client(store, timeout=5)
+    assert caught.value.code == EXIT_AUTH

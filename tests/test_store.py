@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import ClassVar
 
@@ -25,9 +26,11 @@ def _creds(**over) -> Credentials:
 
 def _store(tmp_path, monkeypatch) -> CredentialStore:
     monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
-    store = CredentialStore("test")
-    monkeypatch.setattr(store, "_keyring", lambda: None)  # force the file path
-    return store
+    # Patched on the class, so a test that builds a second store -- which is how
+    # a real second process is simulated -- cannot reach the developer's own
+    # keychain and read, or delete, credentials they actually use.
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: None)
+    return CredentialStore("test")
 
 
 def test_the_file_is_never_world_readable(tmp_path, monkeypatch):
@@ -132,3 +135,110 @@ def test_the_credential_write_is_atomic(tmp_path, monkeypatch):
     assert seen and "psmcp_at_first" in seen[0]
     assert store.load().access_token == "psmcp_at_second"
     assert not list(tmp_path.glob("*.tmp")), "the temp file must not survive"
+
+
+# ----------------------------------------------- which store is authoritative
+
+
+class _LockableRing:
+    """A keychain that can be made to refuse writes, which is what macOS does."""
+
+    def __init__(self) -> None:
+        self.stored: dict[str, str] = {}
+        self.locked = False
+
+    def set_password(self, service, user, value):
+        if self.locked:
+            raise RuntimeError("keychain is locked")
+        self.stored[user] = value
+
+    def get_password(self, service, user):
+        if self.locked:
+            raise RuntimeError("keychain is locked")
+        return self.stored.get(user)
+
+    def delete_password(self, service, user):
+        if self.locked:
+            raise RuntimeError("keychain is locked")
+        self.stored.pop(user, None)
+
+
+def test_a_failed_keychain_write_does_not_resurrect_the_previous_token(tmp_path, monkeypatch):
+    """The sequence that revokes a user's whole grant for no reason.
+
+    A refresh succeeds and the server rotates the pair. `set_password` fails, so
+    the new pair lands in the file. The keychain unlocks; the next command reads
+    it and finds the *old* refresh token, presents it, and the server does
+    exactly what it is designed to do about a spent one.
+
+    The refresh lock cannot help -- both processes agree on the same stale value.
+    """
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    ring = _LockableRing()
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: ring)
+    store = CredentialStore("test")
+
+    store.save(_creds(access_token="at_old", refresh_token="rt_old", expires_at=time.time() + 100))
+    assert ring.stored, "precondition: the keychain holds the first pair"
+
+    ring.locked = True
+    store.save(_creds(access_token="at_new", refresh_token="rt_new", expires_at=time.time() + 600))
+    ring.locked = False
+
+    loaded = CredentialStore("test").load()
+    assert loaded is not None
+    assert loaded.refresh_token == "rt_new", "a spent refresh token was handed back"
+
+
+def test_the_newer_pair_wins_when_both_stores_hold_one(tmp_path, monkeypatch):
+    """The belt to the braces above: the same locked keychain that refuses the
+    write refuses the delete, so `load` cannot rely on the delete having run.
+    `expires_at` decides, because every refresh sets it from the clock.
+    """
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    ring = _LockableRing()
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: ring)
+    store = CredentialStore("test")
+
+    # An older pair in the keychain, a newer one in the file, and neither store
+    # able to clean the other up.
+    ring.stored["test"] = json.dumps(asdict(_creds(refresh_token="rt_old", expires_at=time.time() + 60)))
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: None)
+    store.save(_creds(refresh_token="rt_new", expires_at=time.time() + 900))
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: ring)
+
+    loaded = store.load()
+    assert loaded is not None and loaded.refresh_token == "rt_new"
+
+
+def test_a_corrupt_copy_does_not_shadow_a_good_one(tmp_path, monkeypatch):
+    """One `raw` shared between both sources meant a corrupt keychain blob
+    reported the user as signed out while a perfectly good file sat next to it."""
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    ring = _LockableRing()
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: None)
+    store = CredentialStore("test")
+    store.save(_creds(refresh_token="rt_good"))
+
+    ring.stored["test"] = "{not json at all"
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: ring)
+    loaded = store.load()
+    assert loaded is not None and loaded.refresh_token == "rt_good"
+
+
+def test_a_planted_temp_file_cannot_become_the_credential_file(tmp_path, monkeypatch):
+    """`os.open(..., O_CREAT)` applies its mode only when it *creates* the file.
+
+    A world-readable `{profile}.tmp` left in a shared `PROSHORT_CONFIG_DIR` -- or
+    by a killed process -- would otherwise be written to at its own mode and then
+    renamed over the real credential file.
+    """
+    store = _store(tmp_path, monkeypatch)
+    planted = tmp_path / "test.tmp"
+    planted.write_text("{}")
+    planted.chmod(0o666)
+
+    store.save(_creds())
+
+    assert os.stat(store.path).st_mode & 0o777 == 0o600
+    assert not planted.exists() or os.stat(planted).st_mode & 0o777 == 0o666

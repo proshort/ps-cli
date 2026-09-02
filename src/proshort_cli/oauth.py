@@ -38,7 +38,7 @@ from typing import ClassVar
 
 import httpx
 
-from proshort_cli.errors import EXIT_AUTH, CliError
+from proshort_cli.errors import EXIT_AUTH, EXIT_USAGE, CliError, Unavailable
 from proshort_cli.render import note
 
 DEFAULT_CLIENT_ID = "proshort-cli"
@@ -132,8 +132,15 @@ def login(
     timeout: int = 300,
     open_browser: bool = True,
 ) -> dict:
-    """Run the full flow and return the token response."""
+    """Run the full flow and return the token response.
+
+    `timeout` bounds the whole thing -- the browser wait *and* the redemption --
+    because that is what `--timeout` says it does. The redemption gets whatever is
+    left rather than a second full budget of its own.
+    """
     base_url = base_url.rstrip("/")
+    require_secure(base_url)
+    deadline = time.monotonic() + timeout
     verifier, challenge = _pkce()
     state = secrets.token_urlsafe(24)
 
@@ -164,7 +171,7 @@ def login(
         note(f"  open this to continue:\n  {authorize_url}")
 
     try:
-        result = _serve_until_callback(server, timeout)
+        result = _serve_until_callback(server, max(1, int(deadline - time.monotonic())))
     finally:
         server.server_close()
         _Catcher.expected_state = ""
@@ -187,6 +194,7 @@ def login(
         code=result["code"],
         verifier=verifier,
         redirect_uri=redirect_uri,
+        timeout=max(1, int(deadline - time.monotonic())),
     )
 
 
@@ -204,11 +212,82 @@ def _serve_until_callback(server: http.server.HTTPServer, timeout: int) -> dict[
     return dict(_Catcher.result)
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def require_secure(base_url: str) -> None:
+    """Refuse to send a grant over cleartext.
+
+    RFC 8252 makes loopback HTTP an exception for the *redirect*, and only that:
+    the token endpoint is a different address and carries the `code_verifier` and
+    the refresh token, which is the credential worth thirty days. `--url` is
+    caller-supplied, so without this a mistyped or downgraded `http://` host gets
+    the whole grant in the clear and nothing says a word.
+
+    Loopback stays allowed because that is a local `ps-mcp` on a developer's own
+    machine, where there is no network to be on.
+    """
+    parts = urllib.parse.urlsplit(base_url)
+    if parts.scheme == "https":
+        return
+    host = (parts.hostname or "").strip("[]")
+    if parts.scheme == "http" and host in _LOOPBACK_HOSTS:
+        return
+    raise CliError(
+        f"Refusing to send credentials to {base_url!r} over {parts.scheme or 'no'} scheme.",
+        EXIT_USAGE,
+        hint="Use an https:// address. http:// is only accepted for 127.0.0.1.",
+    )
+
+
+def _post_token(*, base_url: str, data: dict, what: str, timeout: int) -> dict:
+    """Redeem or refresh a grant, and classify the failure the way `/v1` does.
+
+    The exit codes are the interface a Skill branches on: `3` means "tell the
+    user to sign in again", `6` means "Proshort is down, not their fault". This
+    used to map *every* non-200 to `3` and let a transport error escape as a
+    traceback and exit `1` -- a code the Skill's table does not even list. So a
+    503 during the silent ten-minute refresh told the user their session had
+    ended, and a connect timeout told them nothing at all.
+
+    `api._interpret` already made this split for the data plane. This is the same
+    split for the token plane, and the same rule decides it: a status that says
+    the *grant* is gone is the user's to fix; anything that says the *server* did
+    not answer is not.
+    """
+    try:
+        response = httpx.post(
+            f"{base_url.rstrip('/')}/token", data=data, timeout=max(1, timeout)
+        )
+    except httpx.RequestError as exc:
+        raise Unavailable(f"Could not reach Proshort: {exc.__class__.__name__}.") from exc
+
+    if response.status_code == 200:
+        return _token_payload(response, what)
+    # 5xx is the server failing, and 429 is the server asking us to wait; neither
+    # is evidence that the grant is gone. Answering either with "sign in again"
+    # sends the user to redo a sign-in that was never the problem -- and, on a
+    # refresh, throws away a refresh token that is still perfectly good.
+    if response.status_code >= 500 or response.status_code == 429:
+        raise Unavailable(f"Proshort could not complete the {what} ({response.status_code}).")
+    raise CliError(
+        "Your session has ended." if what == "refresh" else f"Sign-in was refused ({response.status_code}).",
+        EXIT_AUTH,
+        hint="Run: proshort login",
+    )
+
+
 def exchange_code(
-    *, base_url: str, client_id: str, code: str, verifier: str, redirect_uri: str
+    *,
+    base_url: str,
+    client_id: str,
+    code: str,
+    verifier: str,
+    redirect_uri: str,
+    timeout: int = 30,
 ) -> dict:
-    response = httpx.post(
-        f"{base_url}/token",
+    return _post_token(
+        base_url=base_url,
         data={
             "grant_type": "authorization_code",
             "code": code,
@@ -216,26 +295,22 @@ def exchange_code(
             "client_id": client_id,
             "code_verifier": verifier,
         },
-        timeout=30,
+        what="sign-in",
+        timeout=timeout,
     )
-    if response.status_code != 200:
-        raise CliError(f"Could not complete sign-in ({response.status_code}).", EXIT_AUTH)
-    return _token_payload(response, "sign-in")
 
 
-def refresh(*, base_url: str, client_id: str, refresh_token: str) -> dict:
-    response = httpx.post(
-        f"{base_url.rstrip('/')}/token",
+def refresh(*, base_url: str, client_id: str, refresh_token: str, timeout: int = 30) -> dict:
+    return _post_token(
+        base_url=base_url,
         data={
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": client_id,
         },
-        timeout=30,
+        what="refresh",
+        timeout=timeout,
     )
-    if response.status_code != 200:
-        raise CliError("Your session has ended.", EXIT_AUTH, hint="Run: proshort login")
-    return _token_payload(response, "refresh")
 
 
 def _token_payload(response: "httpx.Response", what: str) -> dict:
@@ -252,6 +327,14 @@ def _token_payload(response: "httpx.Response", what: str) -> dict:
         raise CliError(f"Could not read the {what} response.", EXIT_AUTH) from exc
     if not isinstance(payload, dict):
         raise CliError(f"The {what} response was not in the expected form.", EXIT_AUTH)
+    # `refresh_token` is required on *both* grants, including the refresh, which
+    # RFC 6749 does not demand: rotation is optional there, and a server may
+    # legitimately return only a new access token. Required anyway because this
+    # client talks to `ps-mcp`, which always rotates and treats re-use of a spent
+    # token as theft -- so a refresh response without a replacement means
+    # something is wrong on the server, and saying so is better than carrying the
+    # old token forward and being revoked as a thief on the call after next.
+    # `api._refresh_locked` indexes this directly on the strength of this check.
     for required in ("access_token", "refresh_token"):
         if not isinstance(payload.get(required), str):
             raise CliError(
@@ -272,6 +355,7 @@ def revoke(*, base_url: str, client_id: str, token: str) -> None:
     Best-effort on purpose: a network failure must not stop the local credentials
     being cleared. The caller reports what happened.
     """
+    require_secure(base_url)
     httpx.post(
         f"{base_url.rstrip('/')}/revoke",
         data={

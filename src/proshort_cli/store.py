@@ -79,24 +79,54 @@ class CredentialStore:
 
     # --------------------------------------------------------------- read/write
 
-    def load(self) -> Credentials | None:
-        raw = None
-        ring = self._keyring()
-        if ring is not None:
-            try:
-                raw = ring.get_password(_SERVICE, self._profile)
-            except Exception:
-                raw = None
-        if raw is None and self._path.exists():
-            raw = self._path.read_text(encoding="utf-8")
+    def _parse(self, raw: str | None) -> Credentials | None:
         if not raw:
             return None
         try:
-            data = json.loads(raw)
-            return Credentials(**data)
+            return Credentials(**json.loads(raw))
         except (json.JSONDecodeError, TypeError):
-            # A corrupt file is not a reason to crash every command. Treat it as
-            # signed out; `ps login` will overwrite it.
+            # A corrupt copy is not a reason to crash every command, and it must
+            # not shadow a good copy in the other store either -- hence a value
+            # per source rather than one shared `raw`.
+            return None
+
+    def load(self) -> Credentials | None:
+        """Whichever store holds the *newer* pair, not whichever we look at first.
+
+        Preferring the keychain unconditionally is what made a failed keychain
+        write catastrophic rather than merely inconvenient. The sequence, on a
+        locked macOS keychain, which is an ordinary afternoon:
+
+        1. A refresh succeeds and the server rotates the pair.
+        2. `set_password` raises, so the new pair goes to the 0600 file.
+        3. The keychain unlocks. The next command reads it and finds the *old*
+           refresh token.
+        4. It presents that token. The server does exactly what it was designed
+           to do about a spent refresh token and revokes the whole family.
+
+        The refresh lock cannot help: both processes agree on the same stale
+        keychain value. Two stores only work if one of them is authoritative, and
+        `expires_at` is what says which -- every refresh sets it from the clock,
+        so the later one is always the newer pair. `save` also drops the keychain
+        copy when it falls back to the file, which fixes it at the source; this
+        fixes it when even that delete could not run.
+        """
+        found = [
+            self._parse(self._from_keyring()),
+            self._parse(self._path.read_text(encoding="utf-8") if self._path.exists() else None),
+        ]
+        live = [c for c in found if c is not None]
+        if not live:
+            return None
+        return max(live, key=lambda c: c.expires_at)
+
+    def _from_keyring(self) -> str | None:
+        ring = self._keyring()
+        if ring is None:
+            return None
+        try:
+            return ring.get_password(_SERVICE, self._profile)
+        except Exception:
             return None
 
     def save(self, credentials: Credentials, *, announce: bool = False) -> None:
@@ -111,17 +141,31 @@ class CredentialStore:
                 # disk once the keychain is holding it.
                 self._path.unlink(missing_ok=True)
                 return
+            # The write failed and the pair is about to go to the file instead.
+            # Delete whatever the keychain still holds: it is the *previous*
+            # pair, and leaving it there is how a rotated-away refresh token gets
+            # presented again and read as theft. Best-effort, because the same
+            # locked keychain that refused the write will refuse this -- which is
+            # why `load` also compares the two rather than trusting this alone.
+            with suppress(Exception):
+                ring.delete_password(_SERVICE, self._profile)
 
         self._dir.mkdir(parents=True, exist_ok=True)
-        # Written to a sibling temp file and renamed, because `os.replace` is
-        # atomic on POSIX. Truncating the real file first leaves a window where a
+        # Written to a temp file and renamed, because `os.replace` is atomic on
+        # POSIX. Truncating the real file first leaves a window where a
         # concurrent `load()` -- and `Client.__init__` does one, outside the lock
         # -- reads an empty file and reports the user as signed out.
         #
-        # Created 0600 *before* anything is written to it: writing first and
-        # chmod-ing after leaves a window where the token is world-readable.
-        tmp = self._path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # `O_EXCL` and a pid in the name, not a fixed `{profile}.tmp` opened with
+        # `O_CREAT`: that only applies its mode when it *creates* the file, so a
+        # pre-existing world-readable temp file -- planted in a shared
+        # `PROSHORT_CONFIG_DIR`, or left by a killed process -- would be written
+        # to at its own mode and then renamed over the real one. `O_EXCL` means
+        # the file is ours and 0600 is ours; `O_NOFOLLOW` means it is a file and
+        # not a symlink pointing somewhere else.
+        tmp = self._dir / f"{self._profile}.{os.getpid()}.tmp"
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(raw)

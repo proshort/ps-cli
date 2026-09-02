@@ -11,6 +11,7 @@ were told to slow down, and the server said by how much. Everything else is
 reported.
 """
 
+import json
 import time
 from typing import Any
 
@@ -18,6 +19,7 @@ import httpx
 
 from proshort_cli import oauth
 from proshort_cli.errors import (
+    EXIT_AUTH,
     EXIT_ERROR,
     CliError,
     InsufficientScope,
@@ -32,16 +34,47 @@ from proshort_cli.store import Credentials, CredentialStore
 # something genuinely wrong rather than on a large legitimate page.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
+# A ceiling on `--all`. The walk's normal terminator is a short page, which is a
+# promise about the *server*: a bug or a proxy that always returns a full page
+# turns `--all` into an unbounded loop against a host `--url` chose. 400 pages at
+# the default size is far past any real pipeline and still bounded, and it fails
+# loudly rather than returning a truncated answer -- the same rule the walk
+# already applies to an error mid-scan.
+MAX_PAGES = 400
+
 
 class Client:
     def __init__(self, store: CredentialStore, *, timeout: int = 60, verbose: bool = False) -> None:
         self._store = store
         self._timeout = timeout
         self._verbose = verbose
+        # One deadline for the life of the command, not one per request. `--timeout`
+        # says "seconds to spend, including waits", and a per-request timeout does
+        # not mean that: `--all` over twelve pages could spend twelve times the
+        # budget and still be inside every individual limit. A `Client` is built
+        # once per command, so its lifetime *is* the command.
+        self._deadline = time.monotonic() + timeout
         credentials = store.load()
         if credentials is None:
             raise NotAuthenticated()
+        try:
+            oauth.require_secure(credentials.base_url)
+        except CliError as exc:
+            # Re-coded on purpose. `require_secure` raises a usage error, which is
+            # right for a mistyped `--url` -- the user is holding the command
+            # wrong. Here the bad address is in a *stored* credential, which a
+            # Skill cannot fix by rebuilding its command line, and exit 2 tells it
+            # to retry forever. The remedy is a fresh sign-in, so say that.
+            raise CliError(
+                str(exc), EXIT_AUTH, hint="Run: proshort login --url https://<your-proshort-host>"
+            ) from exc
         self._credentials = credentials
+
+    def _remaining(self) -> float:
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise Unavailable(f"Gave up after {self._timeout}s (--timeout).")
+        return left
 
     @property
     def base_url(self) -> str:
@@ -82,10 +115,16 @@ class Client:
                 base_url=current.base_url,
                 client_id=current.client_id,
                 refresh_token=current.refresh_token,
+                timeout=int(self._remaining()),
             )
             self._credentials = Credentials(
                 access_token=payload["access_token"],
-                refresh_token=payload.get("refresh_token", current.refresh_token),
+                # Indexed, not `.get(..., current.refresh_token)`. `_token_payload`
+                # already requires a rotated token on this grant and refuses the
+                # response without one, so the default was unreachable code saying
+                # the opposite of the check that guards it -- and quietly carrying
+                # a spent token forward is the one outcome worth never guessing at.
+                refresh_token=payload["refresh_token"],
                 expires_at=time.time() + int(payload.get("expires_in", 600)),
                 scopes=(payload.get("scope") or " ".join(current.scopes)).split(),
                 base_url=current.base_url,
@@ -97,11 +136,10 @@ class Client:
 
     def get(self, path: str, params: list[tuple[str, str]] | None = None) -> dict[str, Any]:
         self._ensure_fresh()
-        deadline = time.monotonic() + self._timeout
         refreshed = False
 
         while True:
-            response = self._send(path, params)
+            response, body = self._send(path, params)
 
             if response.status_code == 401 and not refreshed:
                 # One retry. A second 401 after a successful refresh is not a
@@ -112,18 +150,33 @@ class Client:
 
             if response.status_code == 429:
                 wait = _retry_after(response)
-                if time.monotonic() + wait > deadline:
+                if time.monotonic() + wait > self._deadline:
                     raise RateLimited(wait)
                 if self._verbose:
                     note(f"rate limited; waiting {wait}s")
                 time.sleep(wait)
                 continue
 
-            return self._interpret(response)
+            return self._interpret(response, body)
 
-    def _send(self, path: str, params: list[tuple[str, str]] | None) -> httpx.Response:
+    def _send(
+        self, path: str, params: list[tuple[str, str]] | None
+    ) -> tuple[httpx.Response, bytes]:
+        """One request, read incrementally and abandoned if it runs away.
+
+        **Streamed, not buffered.** `httpx.get` downloads the whole body before
+        returning, so checking `len(response.content)` afterwards refused to
+        *parse* what had already been pulled into memory -- which is not a
+        ceiling, it is a comment. `--url` names the host, so the thing this
+        bounds is a client that would otherwise happily accept gigabytes from
+        wherever it was pointed. The connection is dropped at the cap.
+
+        `Content-Length` is checked first where the server sends one, so an
+        honest large response costs nothing at all.
+        """
         try:
-            response = httpx.get(
+            with httpx.stream(
+                "GET",
                 f"{self.base_url}{path}",
                 params=params or [],
                 headers={
@@ -131,31 +184,40 @@ class Client:
                     "Accept": "application/json",
                     "User-Agent": "proshort-cli",
                 },
-                timeout=self._timeout,
-            )
+                timeout=self._remaining(),
+            ) as response:
+                declared = response.headers.get("Content-Length")
+                if declared and declared.isdigit() and int(declared) > MAX_RESPONSE_BYTES:
+                    raise Unavailable("Proshort returned an unexpectedly large response.")
+                body = bytearray()
+                for chunk in response.iter_bytes():
+                    body.extend(chunk)
+                    if len(body) > MAX_RESPONSE_BYTES:
+                        raise Unavailable("Proshort returned an unexpectedly large response.")
+                return response, bytes(body)
         except httpx.RequestError as exc:
             raise Unavailable(f"Could not reach Proshort: {exc.__class__.__name__}.") from exc
 
-        # The server bounds its own responses; this is the client agreeing not to
-        # be the place an unbounded one lands. Generous relative to the server's
-        # 128KB ceiling, so it only ever catches something genuinely wrong.
-        if len(response.content) > MAX_RESPONSE_BYTES:
-            raise Unavailable("Proshort returned an unexpectedly large response.")
-        return response
+    def _interpret(self, response: httpx.Response, raw: bytes) -> dict[str, Any]:
+        decoded = _decode(raw)
 
-    def _interpret(self, response: httpx.Response) -> dict[str, Any]:
         if response.status_code == 200:
-            return response.json()
+            # Held to the same standard as the failure path below, which was
+            # already careful about this. A 200 carrying a JSON array, or HTML
+            # from a captive portal, used to reach `_emit` and `get_all` as
+            # whatever it happened to be -- and `.get("data")` on a list is an
+            # AttributeError, which escapes as a traceback and exit 1. That is
+            # the exit-code contract breaking at the moment a script most needs
+            # it, which is exactly the argument for guarding the other path.
+            if not isinstance(decoded, dict):
+                raise Unavailable("Proshort returned a response this client could not read.")
+            return decoded
 
         # Whatever the other end sent, not necessarily an object with an object
         # inside it. `.json().get(...)` raises AttributeError on a bare string,
         # which would escape main() as a traceback and exit 1 -- breaking the
         # exit-code contract at the moment a script most needs it.
         body: dict[str, Any] = {}
-        try:
-            decoded = response.json()
-        except ValueError:
-            decoded = None
         if isinstance(decoded, dict) and isinstance(decoded.get("error"), dict):
             body = decoded["error"]
         code = str(body.get("code") or "")
@@ -164,7 +226,13 @@ class Client:
         if code == "insufficient_scope":
             raise InsufficientScope(_scope_from(response))
         if code == "consent_required":
-            raise CliError(message, 3, hint="Run: ps login")
+            # `ps-mcp` cannot currently raise this -- a token issued under an
+            # older consent version is refused by the verifier and is
+            # indistinguishable from an expired one, which is why the server
+            # deliberately does not publish the code. Kept because the answer it
+            # gives is right either way, and a 403 carrying it would otherwise
+            # fall through to a bare exit 1.
+            raise CliError(message, 3, hint="Run: proshort login")
         if response.status_code == 401:
             raise NotAuthenticated(message)
         # Any 5xx, not just the gateway ones. A 500 is still "Proshort is
@@ -201,19 +269,49 @@ class Client:
             paged = [p for p in params if p[0] != "page"] + [("page", str(page))]
             body = self.get(path, paged)
             first = first or body
-            rows = body.get(rows_key) or []
+            rows = body.get(rows_key)
+            if rows is None:
+                rows = []
+            if not isinstance(rows, list):
+                # `extend` on a dict would walk its keys and call that a page of
+                # results, so a shape change downstream would read as a
+                # successful scan of the wrong thing.
+                raise Unavailable("Proshort returned a page this client could not read.")
             merged.extend(rows)
             if not rows or len(rows) < _page_size(body):
                 break
+            if page >= MAX_PAGES:
+                raise Unavailable(
+                    f"Stopped after {MAX_PAGES} pages without reaching the end of the results."
+                )
             page += 1
         first[rows_key] = merged
         first.setdefault("page", {})["returned"] = len(merged)
         return first
 
 
+def _decode(raw: bytes) -> Any:
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
 def _page_size(body: dict[str, Any]) -> int:
-    page = body.get("page") or {}
-    return int(page.get("page_size") or page.get("returned") or 25) or 25
+    """The page size the server reported, or a sane default.
+
+    Every field here comes off the wire, so `int()` on any of them can raise --
+    and a `ValueError` from inside the pagination walk escapes `main()` as a
+    traceback and exit 1, which is the contract breaking mid-scan.
+    """
+    page = body.get("page")
+    if not isinstance(page, dict):
+        return 25
+    for key in ("page_size", "returned"):
+        value = page.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return 25
 
 
 def _retry_after(response: httpx.Response) -> int:

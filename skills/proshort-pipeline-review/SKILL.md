@@ -16,13 +16,20 @@ their credentials file, and never put a token in a command.** The CLI holds
 credentials in the OS keychain; your job is to run commands, not to handle
 secrets.
 
+The CLI also needs to know **which Proshort host to talk to**, and it has no
+default. If it has never been used on this machine, `proshort login` exits 2 with
+"No Proshort API address configured" - that one is not a command you built
+wrong, and retrying will not fix it. Tell the user to run
+`proshort login --url https://<their-proshort-host>`, or to set `PROSHORT_URL`.
+
 Branch on the exit code, never on the message text - the wording will change and
 the numbers will not:
 
 | Exit | Meaning | What to tell the user |
 | --- | --- | --- |
 | 0 | Success | - |
-| 2 | You built the command wrong | Fix it and retry; don't surface this |
+| 1 | Something unexpected | Show the stderr line; do not retry blindly |
+| 2 | You built the command wrong | Fix it and retry - **except** the missing-URL case above, which only the user can fix |
 | 3 | Not signed in | "Run `proshort login`" |
 | 4 | Missing a permission | Run the `proshort login --add-scope ...` line it prints |
 | 5 | Rate limited | Slow down; wait before retrying |
@@ -87,7 +94,10 @@ jq -r '.data[].deal_id' "$workdir/deals.json" | while read -r id; do
   case "$id" in
     ""|*[!A-Za-z0-9_-]*) continue ;;
   esac
-  proshort deals get "$id" --json > "$workdir/deal-$id.json" || continue
+  # `|| exit`, not `|| continue`. A failure here is a deal missing from the
+  # answer, and summarising a half-fetched pipeline as the whole one is the same
+  # silent truncation the CLI refuses in `--all`. Loud beats short.
+  proshort deals get "$id" --json > "$workdir/deal-$id.json" || exit 1
 done
 ```
 
