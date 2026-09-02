@@ -31,6 +31,7 @@ import base64
 import hashlib
 import http.server
 import secrets
+import socketserver
 import time
 import urllib.parse
 import webbrowser
@@ -56,6 +57,25 @@ def _pkce() -> tuple[str, str]:
         base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
     )
     return verifier, challenge
+
+
+class _LoopbackServer(http.server.HTTPServer):
+    """The listener, without the reverse DNS lookup that comes free with it.
+
+    `HTTPServer.server_bind` calls `socket.getfqdn(host)` to populate
+    `server_name`, a field nothing here reads. On a machine whose reverse
+    resolver is slow or absent -- a locked-down corporate network, a CI runner,
+    a laptop on hotel wifi -- that blocks for tens of seconds *before the browser
+    is opened*, so `proshort login` appears to hang at the one moment the user is
+    waiting on it. A GitHub macOS runner spent 36 seconds there.
+
+    The host is `127.0.0.1`. There is nothing to look up.
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
 
 
 class _Catcher(http.server.BaseHTTPRequestHandler):
@@ -148,7 +168,7 @@ def login(
     # rebinding it: between the probe and the rebind another process can take it.
     _Catcher.expected_state = state
     _Catcher.result = {}
-    server = http.server.HTTPServer(("127.0.0.1", 0), _Catcher)
+    server = _LoopbackServer(("127.0.0.1", 0), _Catcher)
     port = int(server.server_address[1])
     redirect_uri = f"http://127.0.0.1:{port}{CALLBACK_PATH}"
 
@@ -198,7 +218,7 @@ def login(
     )
 
 
-def _serve_until_callback(server: http.server.HTTPServer, timeout: int) -> dict[str, str]:
+def _serve_until_callback(server: http.server.HTTPServer, timeout: float) -> dict[str, str]:
     """Serve requests until one is ours, or the deadline passes.
 
     `handle_request` services exactly one request, so calling it once meant the

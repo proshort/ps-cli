@@ -1,6 +1,7 @@
 """The parts of sign-in that are load-bearing."""
 import base64
 import hashlib
+import http.server
 import io
 import time
 
@@ -230,10 +231,69 @@ def test_https_and_a_local_server_are_both_fine(url):
 def test_the_browser_wait_is_bounded_by_the_timeout(monkeypatch):
     """`--timeout` says "seconds to spend, including waits". `login` accepted the
     flag on every subparser and then never passed it on, so the wait stayed at
-    the hardcoded 300s and the help text was simply untrue."""
+    the hardcoded 300s and the help text was simply untrue.
+
+    Asserted on the bound `login` hands down, not on how long the call took. Wall
+    clock measures the runner as much as the code -- an earlier version of this
+    test failed on macOS CI at 36 seconds, and the 36 seconds were a reverse DNS
+    lookup inside `HTTPServer.server_bind`, not a deadline being ignored. A test
+    whose failure points at the wrong function is worse than no test.
+    """
+    handed: list[float] = []
+
+    def fake_serve(_server, timeout):
+        handed.append(timeout)
+        return {}
+
+    monkeypatch.setattr(oauth, "_serve_until_callback", fake_serve)
+    with pytest.raises(CliError) as caught:
+        oauth.login(base_url="https://example.invalid", timeout=7, open_browser=False)
+    assert "Timed out" in str(caught.value)
+    assert handed and handed[0] <= 7, f"login waited on {handed} for a 7s budget"
+
+
+def test_the_wait_loop_returns_when_its_deadline_passes():
+    """The other half: the bound `login` hands down is one the loop honours.
+
+    Driven with a stub server rather than a socket, so this measures the loop and
+    nothing about the machine it runs on.
+    """
+    calls: list[int] = []
+
+    class _NeverCalledBack:
+        timeout = None
+
+        def handle_request(self):
+            calls.append(1)
+            time.sleep(0.01)
+
+    oauth._Catcher.result = {}
     started = time.monotonic()
-    monkeypatch.setattr(oauth.webbrowser, "open", lambda _url: True)
+    assert oauth._serve_until_callback(_NeverCalledBack(), 0.1) == {}
+    assert time.monotonic() - started < 5
+    assert calls, "the loop never served anything"
+
+
+def test_signing_in_does_not_wait_on_reverse_dns(monkeypatch):
+    """`HTTPServer.server_bind` calls `socket.getfqdn` to fill in a field nothing
+    reads. Where the resolver is slow or absent -- a CI runner, hotel wifi, a
+    locked-down corporate network -- that blocks for tens of seconds *before the
+    browser opens*, so `proshort login` appears to hang at the one moment the
+    user is watching it. A GitHub macOS runner spent 36 seconds there.
+
+    Driven through `login` rather than by constructing `_LoopbackServer`
+    directly. Testing the subclass in isolation passes just as happily when
+    `login` has been changed back to the stock `HTTPServer` -- and the wiring is
+    the half that broke.
+    """
+
+    def explode(_host=None):
+        raise AssertionError("bind performed a reverse DNS lookup")
+
+    # Patched where `HTTPServer.server_bind` reaches for it, which is the call
+    # this subclass exists to not make.
+    monkeypatch.setattr(http.server.socket, "getfqdn", explode)
+    monkeypatch.setattr(oauth, "_serve_until_callback", lambda _server, _timeout: {})
     with pytest.raises(CliError) as caught:
         oauth.login(base_url="https://example.invalid", timeout=1, open_browser=False)
     assert "Timed out" in str(caught.value)
-    assert time.monotonic() - started < 10, "the deadline was ignored"
