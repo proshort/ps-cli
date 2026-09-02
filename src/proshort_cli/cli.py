@@ -30,6 +30,20 @@ BASE_URL_ENV = "PROSHORT_URL"
 
 # Columns for the human table. Deliberately few: a terminal row that wraps is
 # worse than one that omits, and `--json` is right there for everything else.
+# The eight windows the server accepts. Hardcoded for the same reason `--type`'s
+# choices are: they are a fixed enum on the other side, argparse needs them at
+# parse time, and being refused locally beats being refused after a round trip.
+AGGREGATION_WINDOWS = [
+    "LAST_1_DAY",
+    "LAST_2_DAYS",
+    "LAST_7_DAYS",
+    "LAST_30_DAYS",
+    "LAST_90_DAYS",
+    "LAST_180_DAYS",
+    "LAST_1_YEAR",
+    "ALL_TIME",
+]
+
 TABLES = {
     "deals": [("NAME", "name"), ("STAGE", "stage"), ("AMOUNT", "amount"), ("CLOSE", "close_date")],
     "recordings": [("TITLE", "title"), ("WHEN", "start_time"), ("SENTIMENT", "call_sentiment")],
@@ -436,7 +450,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_activities)
 
     p = sub.add_parser("reps", parents=[common], help="Per-rep performance.")
-    p.add_argument("--duration", required=True, help="Window; see `proshort filters`.")
+    # `choices`, like `--type`, rather than a pointer to `proshort filters`.
+    # `filters` does not supply this -- it is a fixed enum, and the server's own
+    # tool description says so. Sending someone to an endpoint that cannot answer,
+    # and that legitimately returns an empty list, is how a caller guesses a
+    # window and takes a 422. Validated here so the guess costs no round trip.
+    p.add_argument("--duration", required=True, choices=AGGREGATION_WINDOWS)
     p.add_argument("--limit", type=positive_int, default=10)
     p.set_defaults(func=cmd_reps)
 

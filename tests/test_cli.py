@@ -229,3 +229,35 @@ def test_sign_in_holds_the_refresh_lock_while_it_swaps_the_grant(tmp_path, monke
 def _no_network(*_a, **_k):
     """Stand in for the courtesy `whoami` after sign-in."""
     raise CliError("no network in this test", EXIT_ERROR)
+
+
+def test_the_duration_windows_are_validated_before_a_request_is_made():
+    """`--duration`'s help used to say "see `proshort filters`", and `filters` does
+    not supply it -- it is a fixed enum, and the server's own tool description says
+    the opposite. The same wrong pointer had already been fixed twice on the server
+    (the OpenAPI description and the handler's error message) and was still here.
+
+    `choices`, like `--type`, so a wrong window is refused at the parser with the
+    valid list rather than after a round trip.
+    """
+    with pytest.raises(SystemExit) as caught:
+        _args(["reps", "--duration", "LAST_WEEK"])
+    assert caught.value.code == EXIT_USAGE
+    assert _args(["reps", "--duration", "ALL_TIME"]).duration == "ALL_TIME"
+
+
+def test_no_help_text_points_at_an_endpoint_that_cannot_answer():
+    """`proshort filters` supplies stage, owner, group, department, rep, sentiment
+    and call type. It has nothing to say about `duration`, and any help naming it
+    has to be about a value it actually carries."""
+    import contextlib
+    import io
+
+    parser = cli.build_parser()
+    for argv in (["reps", "--help"], ["deals", "list", "--help"]):
+        buffer = io.StringIO()
+        with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buffer):
+            parser.parse_args(argv)
+        text = buffer.getvalue()
+        if "filters" in text:
+            assert "duration" not in text.split("filters")[0][-120:], text
