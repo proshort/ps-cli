@@ -531,3 +531,89 @@ def test_a_null_page_object_does_not_crash_a_completed_walk(client, monkeypatch)
     body = client.get_all("/v1/deals", [])
     assert body["page"]["returned"] == 1
     assert [row["id"] for row in body["data"]] == [1]
+
+
+def test_the_walk_stops_on_a_short_page_with_no_page_size(client, monkeypatch):
+    """`returned` answers a different question and made the terminator dead.
+
+    It is how many rows are in *this* response, so on an honest server it equals
+    `len(rows)` and `len(rows) < returned` is never true. A last page of ten with
+    `{"returned": 10}` and no `page_size` asked for page eleven -- and a server
+    that refuses a page past the end, rather than returning an empty one, then
+    makes the whole command raise and discard every row it already had.
+    """
+    pages = _queue(
+        monkeypatch,
+        [
+            _response(200, {"data": [{"id": n} for n in range(10)], "page": {"returned": 10}}),
+            _response(400, {"error": {"code": "invalid_argument", "message": "no such page"}}),
+        ],
+    )
+    body = client.get_all("/v1/deals", [])
+    assert len(body["data"]) == 10
+    assert len(pages) == 1, "asked for a page past the end of the results"
+
+
+def test_a_scope_the_client_does_not_know_is_not_put_in_the_hint(client, monkeypatch):
+    """The hint is a line the reference Skill is told to act on.
+
+    `sanitize_line` strips escape sequences and newlines -- not `;`, backticks or
+    `$()`. Against a compromised host or an intercepting proxy, an agent pasting
+    the printed line into a shell is the injection, and the CLI handed it over.
+    """
+    _queue(
+        monkeypatch,
+        [
+            _response(
+                403,
+                {"error": {"code": "insufficient_scope", "message": "nope"}},
+                {"WWW-Authenticate": 'Bearer error="insufficient_scope", scope="deals:read; echo pwned"'},
+            )
+        ],
+    )
+    with pytest.raises(CliError) as caught:
+        client.get("/v1/deals")
+    assert "echo pwned" not in str(caught.value)
+    assert "echo pwned" not in (caught.value.hint or "")
+    assert caught.value.hint == "Run: proshort login"
+
+
+def test_a_scope_the_client_does_know_is_still_named(client, monkeypatch):
+    """The allowlist must not cost the useful case."""
+    _queue(
+        monkeypatch,
+        [
+            _response(
+                403,
+                {"error": {"code": "insufficient_scope", "message": "nope"}},
+                {"WWW-Authenticate": 'Bearer error="insufficient_scope", scope="deals:read"'},
+            )
+        ],
+    )
+    with pytest.raises(CliError) as caught:
+        client.get("/v1/deals")
+    assert caught.value.hint == "Run: proshort login --add-scope deals:read"
+
+
+def test_one_command_will_not_hold_more_than_its_total_ceiling(client, monkeypatch):
+    """`MAX_RESPONSE_BYTES` bounds one response; `--all` multiplies it by up to
+    `MAX_PAGES`, and `get_all` keeps every row. Against a wrong or hostile host
+    the user has already signed into, the walk is the denial of service."""
+    monkeypatch.setattr(api, "MAX_TOTAL_BYTES", 4096)
+    row = {"id": "x" * 200}
+    pages = 0
+
+    def endless(_method, _url, **_kwargs):
+        nonlocal pages
+        pages += 1
+        return _Streamed(_response(200, {"data": [row] * 20, "page": {"page_size": 20}}))
+
+    monkeypatch.setattr(api.httpx, "stream", endless)
+    with pytest.raises(CliError) as caught:
+        client.get_all("/v1/deals", [])
+
+    assert caught.value.code == EXIT_UNAVAILABLE
+    # Named, because `MAX_PAGES` also ends this walk with the same exit code --
+    # 400 pages later, and long after the memory this bounds was allocated.
+    assert "willing to hold in memory" in str(caught.value)
+    assert pages < api.MAX_PAGES, f"the page ceiling stopped it first, after {pages}"

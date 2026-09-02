@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from proshort_cli import oauth
+from proshort_cli import __version__, oauth
 from proshort_cli.errors import (
     EXIT_AUTH,
     EXIT_ERROR,
@@ -28,6 +28,7 @@ from proshort_cli.errors import (
     Unavailable,
 )
 from proshort_cli.render import note
+from proshort_cli.scopes import SCOPES
 from proshort_cli.store import Credentials, CredentialStore
 
 # Well above the server's 128KB response ceiling, so this only fires on
@@ -42,6 +43,19 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 # already applies to an error mid-scan.
 MAX_PAGES = 400
 
+# What a page is assumed to hold when the server does not say. Matches ps-mcp's
+# `max_page_size` default, and it is only a terminator hint: getting it wrong
+# costs one extra request, never a truncated answer.
+DEFAULT_PAGE_SIZE = 25
+
+# A ceiling on everything one command accumulates, not just one response.
+# `MAX_RESPONSE_BYTES` is generous against a 128KB server ceiling, and `--all`
+# multiplies it: 400 pages of 8 MiB is 3.2 GB held in memory, because `get_all`
+# keeps every row. Against real `ps-mcp` neither number is ever approached;
+# against a wrong or hostile host the user has already signed into, the walk is
+# the denial of service.
+MAX_TOTAL_BYTES = 64 * 1024 * 1024
+
 
 class Client:
     def __init__(self, store: CredentialStore, *, timeout: int = 60, verbose: bool = False) -> None:
@@ -54,6 +68,7 @@ class Client:
         # budget and still be inside every individual limit. A `Client` is built
         # once per command, so its lifetime *is* the command.
         self._deadline = time.monotonic() + timeout
+        self._bytes_read = 0
         credentials = store.load()
         if credentials is None:
             raise NotAuthenticated()
@@ -187,7 +202,9 @@ class Client:
                 headers={
                     "Authorization": f"Bearer {self._credentials.access_token}",
                     "Accept": "application/json",
-                    "User-Agent": "proshort-cli",
+                    # Versioned, because the first support question is which
+                    # build somebody is on and a bare product name cannot answer it.
+                    "User-Agent": f"proshort-cli/{__version__}",
                 },
                 timeout=self._remaining(),
                 # Already the httpx default. Pinned because this request carries a
@@ -203,6 +220,11 @@ class Client:
                     body.extend(chunk)
                     if len(body) > MAX_RESPONSE_BYTES:
                         raise Unavailable("Proshort returned an unexpectedly large response.")
+                    if self._bytes_read + len(body) > MAX_TOTAL_BYTES:
+                        raise Unavailable(
+                            "This command has read more than it is willing to hold in memory."
+                        )
+                self._bytes_read += len(body)
                 return response, bytes(body)
         except httpx.RequestError as exc:
             raise Unavailable(f"Could not reach Proshort: {exc.__class__.__name__}.") from exc
@@ -314,20 +336,32 @@ def _decode(raw: bytes) -> Any:
 
 
 def _page_size(body: dict[str, Any]) -> int:
-    """The page size the server reported, or a sane default.
+    """The page size the server reported, or the default.
+
+    **`page_size` only.** `returned` used to be the fallback, and it answers a
+    different question: how many rows are in *this* response. On an honest server
+    that is `len(rows)`, so `len(rows) < returned` is never true and the short-page
+    terminator never fires -- a last page of ten with `{"returned": 10}` and no
+    `page_size` asks for page eleven. That extra request is how `--all` fails
+    *after* a complete scan: a server that refuses a page past the end, rather
+    than returning an empty one, makes the whole command raise and throw away
+    every row it already had. Loud, but loudly wrong -- "Proshort failed" with the
+    pipeline sitting in memory.
+
+    `test_a_junk_page_size_does_not_crash_the_walk` hid it: `"twenty"` fell
+    through to an absent `returned` and landed on the default, and one row is
+    fewer than 25, so the walk stopped for the wrong reason.
 
     Every field here comes off the wire, so `int()` on any of them can raise --
-    and a `ValueError` from inside the pagination walk escapes `main()` as a
-    traceback and exit 1, which is the contract breaking mid-scan.
+    mid-scan, where it escapes as a traceback.
     """
     page = body.get("page")
     if not isinstance(page, dict):
-        return 25
-    for key in ("page_size", "returned"):
-        value = page.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            return value
-    return 25
+        return DEFAULT_PAGE_SIZE
+    value = page.get("page_size")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return DEFAULT_PAGE_SIZE
 
 
 def _retry_after(response: httpx.Response) -> int:
@@ -339,8 +373,23 @@ def _retry_after(response: httpx.Response) -> int:
 
 
 def _scope_from(response: httpx.Response) -> str | None:
+    """The missing scope named in the challenge, **only if we already know it**.
+
+    This value ends up in a hint the reference Skill is told to act on, and
+    `sanitize_line` strips escape sequences and newlines -- not `;`, backticks or
+    `$()`. Against a trusted `ps-mcp` a hostile scope is a server bug rather than
+    an attacker; against a compromised host, an intercepting proxy, or a future
+    mistake in that header, an agent pasting the printed line into a shell is the
+    injection, and the CLI handed it over.
+
+    An allowlist rather than an escape, because there is nothing to escape *for*:
+    the set of scopes is fixed, known here, and short. Anything outside it means
+    the caller is told to sign in without a scope named at all -- less specific,
+    and never a value the server chose.
+    """
     challenge = response.headers.get("WWW-Authenticate", "")
     marker = 'scope="'
-    if marker in challenge:
-        return challenge.split(marker, 1)[1].split('"', 1)[0]
-    return None
+    if marker not in challenge:
+        return None
+    named = challenge.split(marker, 1)[1].split('"', 1)[0]
+    return named if named in SCOPES else None

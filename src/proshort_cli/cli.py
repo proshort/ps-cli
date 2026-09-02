@@ -15,8 +15,9 @@ from urllib.parse import quote
 
 from proshort_cli import __version__, oauth, render
 from proshort_cli.api import Client
-from proshort_cli.errors import EXIT_OK, EXIT_USAGE, CliError
+from proshort_cli.errors import EXIT_OK, EXIT_USAGE, CliError, KeychainUnavailable
 from proshort_cli.render import emit_json, emit_table, note
+from proshort_cli.scopes import SCOPES
 from proshort_cli.store import Credentials, CredentialStore
 
 # Deliberately no default. The previous one was `*.internal.proshort.ai`, which a
@@ -25,14 +26,7 @@ from proshort_cli.store import Credentials, CredentialStore
 # thing to diagnose from the outside. An explicit value, or a clear refusal.
 BASE_URL_ENV = "PROSHORT_URL"
 
-SCOPES = [
-    "profile:read",
-    "filters:read",
-    "deals:read",
-    "reps:read",
-    "recordings:read",
-    "meetings:read",
-]
+
 
 # Columns for the human table. Deliberately few: a terminal row that wraps is
 # worse than one that omits, and `--json` is right there for everything else.
@@ -71,9 +65,25 @@ def positive_int(raw: str) -> int:
 # --------------------------------------------------------------------- commands
 
 
+def _previous(store: CredentialStore):
+    """What is already stored, or `None` if that cannot be established.
+
+    `load` raises when the keychain is unreadable and holds the only possible
+    copy, which is the right answer for a command that is about to *use* a
+    session. `login` and `logout` are the two that are about to replace or end
+    one, and neither should be blocked by a locked keychain: `save` now stamps a
+    generation above anything this machine has issued, so a new grant written
+    while the keychain is locked still wins once it unlocks.
+    """
+    try:
+        return store.load()
+    except KeychainUnavailable:
+        return None
+
+
 def cmd_login(args) -> int:
     store = CredentialStore(args.profile)
-    existing = store.load()
+    existing = _previous(store)
     if args.scope and args.add_scope:
         # --add-scope used to overwrite --scope entirely, so one of the two the
         # user typed was silently dropped. Refused rather than guessed at.
@@ -132,7 +142,7 @@ def cmd_login(args) -> int:
     # The browser wait is deliberately *outside* the lock: holding it for five
     # minutes would block every other command on the machine.
     with store.refresh_lock():
-        superseded = store.load()
+        superseded = _previous(store)
         store.save(
             announce=True,
             credentials=Credentials(
@@ -186,7 +196,7 @@ def cmd_logout(args) -> int:
     # is a strange way to end a session the user asked to end politely. It also
     # stops that refresh from writing the credentials back after `clear()`.
     with store.refresh_lock():
-        existing = store.load()
+        existing = _previous(store)
         if existing is not None:
             # Suppressed rather than caught-and-ignored: revocation is best effort
             # by design and the outcome is reported below, so there is nothing to
@@ -198,8 +208,18 @@ def cmd_logout(args) -> int:
                     token=existing.refresh_token,
                 )
                 revoked = True
-        store.clear()
-    if existing is not None and not revoked:
+        cleared = store.clear()
+    if not cleared:
+        # The keychain refused the delete, so the credential is still there and
+        # will come back when it unlocks. Saying "signed out" over that is the
+        # same lie as reporting a locked keychain as a signed-out user.
+        note(
+            "\u2713 revoked, but the OS keychain could not be cleared \u2014 unlock it and "
+            "run `proshort logout` again"
+            if revoked
+            else "\u2717 could not revoke the session and could not clear the OS keychain"
+        )
+    elif existing is not None and not revoked:
         note("\u2713 signed out locally \u2014 could not reach Proshort to revoke the session")
     else:
         note("\u2713 signed out")
@@ -400,7 +420,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stage", action="append")
     p.add_argument("--owner", action="append")
     p.add_argument("--limit", type=positive_int, default=25)
-    p.add_argument("--all", action="store_true", help="Follow pages to the server's cap.")
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="Follow every page. --limit is the size of each page, not a total.",
+    )
     p.set_defaults(func=cmd_deals_list)
     p = deals.add_parser("get", parents=[common])
     p.add_argument("deal_id")
@@ -421,7 +445,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--q")
     p.add_argument("--since", help="From this date, YYYY-MM-DD.")
     p.add_argument("--limit", type=positive_int, default=25)
-    p.add_argument("--all", action="store_true")
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="Follow every page. --limit is the size of each page, not a total.",
+    )
     p.set_defaults(func=cmd_recordings)
 
     p = sub.add_parser("calls", parents=[common], help="AI summaries for recorded calls.")

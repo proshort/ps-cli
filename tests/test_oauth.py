@@ -9,12 +9,21 @@ import httpx
 import pytest
 
 from proshort_cli import oauth
-from proshort_cli.errors import EXIT_AUTH, EXIT_UNAVAILABLE, EXIT_USAGE, CliError
+from proshort_cli.errors import (
+    EXIT_AUTH,
+    EXIT_RATE_LIMIT,
+    EXIT_UNAVAILABLE,
+    EXIT_USAGE,
+    CliError,
+)
 
 
-def _token_response(status: int, payload) -> httpx.Response:
+def _token_response(status: int, payload, headers=None) -> httpx.Response:
     return httpx.Response(
-        status, json=payload, request=httpx.Request("POST", "https://example.invalid/token")
+        status,
+        json=payload,
+        headers=headers or {},
+        request=httpx.Request("POST", "https://example.invalid/token"),
     )
 
 
@@ -162,7 +171,7 @@ def _post_raising(monkeypatch, exc):
     monkeypatch.setattr(oauth.httpx, "post", fake_post)
 
 
-@pytest.mark.parametrize("status", [500, 502, 503, 429])
+@pytest.mark.parametrize("status", [500, 502, 503])
 def test_a_server_failure_on_refresh_is_not_the_end_of_the_session(monkeypatch, status):
     """A 503 during the silent ten-minute refresh used to say "your session has
     ended" and throw away a refresh token that was still perfectly good."""
@@ -355,3 +364,35 @@ def test_the_url_is_printed_when_the_browser_does_not_open(monkeypatch, capsys):
     printed = capsys.readouterr().err
     assert "opened your browser" not in printed
     assert "/authorize?" in printed
+
+
+def test_a_throttled_token_endpoint_says_slow_down_not_that_proshort_is_down(monkeypatch):
+    """The data plane already tells "wait" from "broken"; the token plane did not.
+
+    A 429 on `/token` during the silent refresh answered exit 6, so a Skill
+    reported an outage and gave up on a refresh token that was still perfectly
+    good. Exit 5 is the code that means back off.
+    """
+    _post_returning(
+        monkeypatch, _token_response(429, {}, headers={"Retry-After": "12"})
+    )
+    with pytest.raises(CliError) as caught:
+        oauth.refresh(base_url="https://example.invalid", client_id="c", refresh_token="r")
+    assert caught.value.code == EXIT_RATE_LIMIT
+    assert "12s" in str(caught.value)
+
+
+@pytest.mark.parametrize("body", [b"<html>gateway</html>", b'"just a string"', b"[1,2]"])
+def test_a_200_that_cannot_be_read_is_the_servers_fault_too(monkeypatch, body):
+    """A 200 missing `access_token` already answered 6. A 200 that is not JSON at
+    all, or is not an object, answered 3 -- telling the user to sign in again
+    about a garbage response from a server that thinks it succeeded."""
+    _post_returning(
+        monkeypatch,
+        httpx.Response(
+            200, content=body, request=httpx.Request("POST", "https://example.invalid/token")
+        ),
+    )
+    with pytest.raises(CliError) as caught:
+        oauth.refresh(base_url="https://example.invalid", client_id="c", refresh_token="r")
+    assert caught.value.code == EXIT_UNAVAILABLE

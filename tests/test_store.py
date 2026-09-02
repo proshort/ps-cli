@@ -10,7 +10,7 @@ from typing import ClassVar
 
 import pytest
 
-from proshort_cli.errors import EXIT_USAGE, CliError
+from proshort_cli.errors import EXIT_USAGE, CliError, KeychainUnavailable
 from proshort_cli.store import Credentials, CredentialStore
 
 
@@ -128,8 +128,10 @@ def test_the_credential_write_is_atomic(tmp_path, monkeypatch):
 
     def watched(src, dst):
         # At the moment of the rename the destination still holds the old,
-        # complete value -- never an empty or partial one.
-        seen.append(Path(dst).read_text(encoding="utf-8"))
+        # complete value -- never an empty or partial one. Only the credential
+        # file matters here; `save` also renames the sequence file.
+        if Path(dst) == store.path:
+            seen.append(Path(dst).read_text(encoding="utf-8"))
         return real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", watched)
@@ -196,7 +198,10 @@ def test_a_failed_keychain_write_does_not_resurrect_the_previous_token(tmp_path,
 def test_the_newer_pair_wins_when_both_stores_hold_one(tmp_path, monkeypatch):
     """The belt to the braces above: the same locked keychain that refuses the
     write refuses the delete, so `load` cannot rely on the delete having run.
-    `expires_at` decides, because every refresh sets it from the clock.
+
+    `generation` decides, not `expires_at` -- see `load`. This comment said
+    `expires_at` long after the code stopped using it, which is exactly how the
+    next person to "simplify" the comparison would reintroduce the bug.
     """
     monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
     ring = _LockableRing()
@@ -317,3 +322,84 @@ def test_a_blob_with_the_right_keys_and_wrong_types_is_treated_as_signed_out(tmp
         blob.update(broken)
         store.path.write_text(json.dumps(blob), encoding="utf-8")
         assert store.load() is None, broken
+
+
+def test_a_locked_keychain_does_not_read_as_signed_out(tmp_path, monkeypatch):
+    """The path that actually happens on a Mac.
+
+    A successful keychain write deletes the file, so on the happy path the
+    keychain is the only copy. Treating "locked" as "empty" therefore reported a
+    signed-in user as signed out and sent them to `proshort login` to fix a
+    keychain problem -- which is both the wrong instruction and the start of the
+    generation loss below.
+    """
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    ring = _LockableRing()
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: ring)
+    store = CredentialStore("test")
+    store.save(_creds(refresh_token="rt_live"))
+    assert not store.path.exists(), "precondition: the keychain holds the only copy"
+
+    ring.locked = True
+    with pytest.raises(KeychainUnavailable) as caught:
+        store.load()
+    assert "keychain" in str(caught.value).lower()
+    assert caught.value.hint and "unlock" in caught.value.hint.lower()
+
+    ring.locked = False
+    assert store.load().refresh_token == "rt_live"
+
+
+def test_a_login_while_the_keychain_is_locked_is_not_lost_when_it_unlocks(tmp_path, monkeypatch):
+    """The half `at_least` could not cover.
+
+    `at_least` only works when the caller is holding the number to beat, and on a
+    locked keychain nobody is: `load` finds nothing, `cmd_login` passes
+    `generation=0`, `_next_generation` cannot see the hidden copy either, and the
+    new grant is written as generation 1 against a keychain holding 5. On unlock
+    the comparison picks the old grant -- so the re-login silently reverts, and a
+    narrowed `--scope` or a different user reverts with it.
+    """
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    ring = _LockableRing()
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: ring)
+    store = CredentialStore("test")
+    for n in range(5):
+        store.save(_creds(refresh_token=f"rt_{n}"))
+    hidden = json.loads(ring.stored["test"])["generation"]
+    assert hidden == 5 and not store.path.exists()
+
+    ring.locked = True
+    store.save(_creds(refresh_token="rt_after_relogin"))
+    written = json.loads(store.path.read_text())["generation"]
+    assert written > hidden, f"new grant written as {written} against a hidden {hidden}"
+
+    ring.locked = False
+    assert CredentialStore("test").load().refresh_token == "rt_after_relogin"
+
+
+def test_a_keychain_that_cannot_be_cleared_is_not_reported_as_signed_out(tmp_path, monkeypatch):
+    """A locked keychain refuses `delete_password` exactly as it refuses
+    `set_password`, so "signed out" was printed over a credential that comes back
+    on unlock."""
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    ring = _LockableRing()
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: ring)
+    store = CredentialStore("test")
+    store.save(_creds())
+
+    ring.locked = True
+    assert store.clear() is False
+    ring.locked = False
+    assert store.clear() is True
+
+
+def test_a_scopes_list_of_non_strings_is_treated_as_corrupt(tmp_path, monkeypatch):
+    """`list` alone lets `[1, 2]` through, and `" ".join(...)` on it is a traceback
+    several commands later -- the same standard already applied to `expires_at`."""
+    store = _store(tmp_path, monkeypatch)
+    store.save(_creds())
+    blob = asdict(_creds())
+    blob["scopes"] = [1, 2]
+    store.path.write_text(json.dumps(blob), encoding="utf-8")
+    assert store.load() is None

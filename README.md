@@ -25,6 +25,18 @@ Running from a clone rather than an install is fine, but `proshort --version`
 reads the *installed* package metadata and will report `0.0.0+source`. Use
 `uv pip install -e .` in the clone if you need the real number.
 
+**The Skill does not come with the install.** `uv tool install` ships the
+`proshort_cli` package and nothing else, so [`skills/`](skills/) has to be copied
+separately into wherever Claude Code reads skills from:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/proshort/ps-cli/main/skills/proshort-pipeline-review/SKILL.md \
+  -o ~/.claude/skills/proshort-pipeline-review/SKILL.md
+```
+
+It is deliberately a copy rather than package data: a Skill is something you read
+and edit for your own pipeline, not a file buried in `site-packages`.
+
 **macOS and Linux only in 0.1.0.** The refresh lock uses `fcntl`, so importing
 this on Windows fails. A port needs `msvcrt.locking` behind the same interface -
 not a large change, just not this one.

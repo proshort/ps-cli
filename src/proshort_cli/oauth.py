@@ -39,7 +39,7 @@ from typing import ClassVar
 
 import httpx
 
-from proshort_cli.errors import EXIT_AUTH, EXIT_USAGE, CliError, Unavailable
+from proshort_cli.errors import EXIT_AUTH, EXIT_USAGE, CliError, RateLimited, Unavailable
 from proshort_cli.render import note
 
 DEFAULT_CLIENT_ID = "proshort-cli"
@@ -298,7 +298,14 @@ def _post_token(*, base_url: str, data: dict, what: str, timeout: int) -> dict:
     # is evidence that the grant is gone. Answering either with "sign in again"
     # sends the user to redo a sign-in that was never the problem -- and, on a
     # refresh, throws away a refresh token that is still perfectly good.
-    if response.status_code >= 500 or response.status_code == 429:
+    if response.status_code == 429:
+        # Exit 5, not 6. The data plane already tells "slow down" from "the server
+        # is broken", and answering a throttled token endpoint with "Proshort is
+        # unavailable" told a Skill to give up on a refresh token that is still
+        # perfectly good. `Retry-After` where the server sent one, so the wait is
+        # theirs rather than a number invented here.
+        raise RateLimited(_retry_after(response))
+    if response.status_code >= 500:
         raise Unavailable(f"Proshort could not complete the {what} ({response.status_code}).")
     raise CliError(
         "Your session has ended." if what == "refresh" else f"Sign-in was refused ({response.status_code}).",
@@ -343,6 +350,14 @@ def refresh(*, base_url: str, client_id: str, refresh_token: str, timeout: int =
     )
 
 
+def _retry_after(response: "httpx.Response") -> int:
+    raw = response.headers.get("Retry-After")
+    try:
+        return max(1, int(raw)) if raw else 30
+    except ValueError:
+        return 30
+
+
 def _token_payload(response: "httpx.Response", what: str) -> dict:
     """Validate a token response before anything indexes into it.
 
@@ -351,12 +366,16 @@ def _token_payload(response: "httpx.Response", what: str) -> dict:
     or an `AttributeError` -- which escapes `main()` as a traceback and exit 1,
     breaking the exit-code contract at exactly the moment a script most needs it.
     """
+    # `Unavailable`, not `EXIT_AUTH`, for both. A 200 that cannot be parsed is the
+    # server failing exactly as a 200 missing `access_token` is, and the missing
+    # field already answered 6 -- telling a user to sign in again over a garbage
+    # 200 sends them to redo something that was never the problem.
     try:
         payload = response.json()
     except ValueError as exc:
-        raise CliError(f"Could not read the {what} response.", EXIT_AUTH) from exc
+        raise Unavailable(f"Proshort's {what} response could not be read.") from exc
     if not isinstance(payload, dict):
-        raise CliError(f"The {what} response was not in the expected form.", EXIT_AUTH)
+        raise Unavailable(f"Proshort's {what} response was not in the expected form.")
     # `refresh_token` is required on *both* grants, including the refresh, which
     # RFC 6749 does not demand: rotation is optional there, and a server may
     # legitimately return only a new access token. Required anyway because this

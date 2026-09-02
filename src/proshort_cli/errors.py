@@ -47,6 +47,27 @@ class InsufficientScope(CliError):
         )
 
 
+class KeychainUnavailable(CliError):
+    """The keychain is present, unreadable, and holds the only possible copy.
+
+    Deliberately not `NotAuthenticated`. "Not signed in -- run `proshort login`"
+    is a *claim about the server*, and it is false here: the grant is very likely
+    sitting in a locked keychain, still valid, and a re-login is not what fixes
+    it. Sending someone to sign in again for a locked keychain is how they end up
+    with two grants and no idea why.
+
+    Exit 1, so a Skill shows the line and stops rather than retrying: this is a
+    local condition only the person at the machine can clear.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The OS keychain could not be read, so whether you are signed in is unknown.",
+            EXIT_ERROR,
+            hint="Unlock your login keychain, then run the command again.",
+        )
+
+
 class RateLimited(CliError):
     def __init__(self, retry_after: int) -> None:
         super().__init__(
