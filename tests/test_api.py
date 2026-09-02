@@ -14,6 +14,7 @@ from proshort_cli.api import Client
 from proshort_cli.errors import (
     EXIT_AUTH,
     EXIT_ERROR,
+    EXIT_USAGE,
     EXIT_RATE_LIMIT,
     EXIT_UNAVAILABLE,
     CliError,
@@ -116,10 +117,14 @@ def test_all_asks_for_each_page_in_turn(client, monkeypatch):
 def test_all_fails_loudly_on_a_mid_scan_error(client, monkeypatch):
     """The regression this file exists for.
 
-    A 500 on page two used to be swallowed as "the depth cap, reached": the
+    An error on page two used to be swallowed as "the depth cap, reached": the
     command returned page one and exited 0, so a Skill would summarise a partial
     pipeline as the whole thing. Silent truncation is the one failure mode this
     command must not have.
+
+    The 422 here is the real shape -- walking past `max_page_number` is what
+    ps-mcp refuses mid-scan. What matters is that it *raises*; the code is exit 2
+    because a refused value is the caller having built the request wrong.
     """
     _queue(
         monkeypatch,
@@ -130,7 +135,7 @@ def test_all_fails_loudly_on_a_mid_scan_error(client, monkeypatch):
     )
     with pytest.raises(CliError) as caught:
         client.get_all("/v1/deals", [])
-    assert caught.value.code == EXIT_ERROR
+    assert caught.value.code == EXIT_USAGE
 
 
 def test_all_surfaces_an_unavailable_downstream_rather_than_truncating(client, monkeypatch):
@@ -617,3 +622,34 @@ def test_one_command_will_not_hold_more_than_its_total_ceiling(client, monkeypat
     # 400 pages later, and long after the memory this bounds was allocated.
     assert "willing to hold in memory" in str(caught.value)
     assert pages < api.MAX_PAGES, f"the page ceiling stopped it first, after {pages}"
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(422, "invalid_argument"), (422, ""), (400, "invalid_argument")],
+)
+def test_a_value_the_server_refuses_is_a_usage_error(client, monkeypatch, status, code):
+    """Exit 2, the same code argparse gives a malformed command line.
+
+    The server refusing a value is the caller having built the request wrong,
+    which is what exit 2 means and what a Skill is told to do about it. This fell
+    through to exit 1 -- "something unexpected; do not retry blindly" -- so an
+    agent that sent `--duration LAST_WEEK` was told to give up rather than to
+    correct it, and the message naming the eight valid values went to waste.
+
+    Found by running the CLI against a live server. Every unit test here asserted
+    what the code did rather than what the contract says.
+    """
+    _queue(monkeypatch, [_response(status, {"error": {"code": code, "message": "bad value"}})])
+    with pytest.raises(CliError) as caught:
+        client.get("/v1/deals")
+    assert caught.value.code == EXIT_USAGE
+
+
+def test_an_unclassified_failure_is_still_exit_one(client, monkeypatch):
+    """The usage mapping must not swallow everything else: a 400 the server did
+    not describe is not the caller knowing which argument to change."""
+    _queue(monkeypatch, [_response(409, {"error": {"code": "conflict", "message": "nope"}})])
+    with pytest.raises(CliError) as caught:
+        client.get("/v1/deals")
+    assert caught.value.code == EXIT_ERROR

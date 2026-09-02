@@ -21,6 +21,7 @@ from proshort_cli import __version__, oauth
 from proshort_cli.errors import (
     EXIT_AUTH,
     EXIT_ERROR,
+    EXIT_USAGE,
     CliError,
     InsufficientScope,
     NotAuthenticated,
@@ -272,6 +273,17 @@ class Client:
         # the generic failure that exit 1 means.
         if response.status_code >= 500 or code == "upstream_error":
             raise Unavailable(message)
+        if code == "invalid_argument" or response.status_code == 422:
+            # Exit 2, the same code argparse gives a malformed command line. The
+            # server refusing a *value* is the caller having built the request
+            # wrong, which is exactly what exit 2 means and what a Skill is told
+            # to do about it -- fix the argument and retry. This fell through to
+            # exit 1 ("something unexpected; do not retry blindly"), so an agent
+            # that sent `--duration LAST_WEEK` was told to give up rather than to
+            # correct it, and the message naming the eight valid values went to
+            # waste. Only found by running the CLI against a live server; every
+            # unit test asserted the behaviour rather than the contract.
+            raise CliError(message, EXIT_USAGE)
         raise CliError(message, EXIT_ERROR)
 
     # --------------------------------------------------------------- pagination
