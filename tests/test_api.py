@@ -14,9 +14,9 @@ from proshort_cli.api import Client
 from proshort_cli.errors import (
     EXIT_AUTH,
     EXIT_ERROR,
-    EXIT_USAGE,
     EXIT_RATE_LIMIT,
     EXIT_UNAVAILABLE,
+    EXIT_USAGE,
     CliError,
     InsufficientScope,
     NotAuthenticated,
