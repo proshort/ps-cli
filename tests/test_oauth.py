@@ -25,7 +25,7 @@ def _drive(path: str, expected_state: str, host: str = "127.0.0.1:1234") -> int:
     oauth._Catcher.result = {}
 
     class _Fake(oauth._Catcher):
-        def __init__(self):  # noqa: D107 - bypasses BaseHTTPRequestHandler's socket setup
+        def __init__(self):
             self.path = path
             self.headers = {"Host": host}
             self.status = 0

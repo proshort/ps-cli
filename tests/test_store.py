@@ -4,19 +4,21 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
+from typing import ClassVar
 
-from proshort_cli.store import CredentialStore, Credentials
+from proshort_cli.store import Credentials, CredentialStore
 
 
 def _creds(**over) -> Credentials:
-    base = dict(
-        access_token="psmcp_at_x",
-        refresh_token="psmcp_rt_x",
-        expires_at=time.time() + 600,
-        scopes=["deals:read"],
-        base_url="https://example.invalid",
-        client_id="proshort-cli",
-    )
+    base = {
+        "access_token": "psmcp_at_x",
+        "refresh_token": "psmcp_rt_x",
+        "expires_at": time.time() + 600,
+        "scopes": ["deals:read"],
+        "base_url": "https://example.invalid",
+        "client_id": "proshort-cli",
+    }
     base.update(over)
     return Credentials(**base)
 
@@ -87,7 +89,7 @@ def test_saving_to_the_keychain_removes_any_earlier_file_copy(tmp_path, monkeypa
     assert store.path.exists()
 
     class _Ring:
-        stored: dict = {}
+        stored: ClassVar[dict] = {}
 
         def set_password(self, service, user, value):
             self.stored[user] = value
@@ -121,7 +123,7 @@ def test_the_credential_write_is_atomic(tmp_path, monkeypatch):
     def watched(src, dst):
         # At the moment of the rename the destination still holds the old,
         # complete value -- never an empty or partial one.
-        seen.append(open(dst, encoding="utf-8").read())
+        seen.append(Path(dst).read_text(encoding="utf-8"))
         return real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", watched)

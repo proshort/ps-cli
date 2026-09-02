@@ -25,7 +25,7 @@ import fcntl
 import json
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -72,9 +72,9 @@ class CredentialStore:
 
     def _keyring(self):
         try:
-            import keyring  # noqa: PLC0415 - optional dependency, probed at use
+            import keyring
             return keyring
-        except Exception:  # noqa: BLE001 - absent or no usable backend
+        except Exception:
             return None
 
     # --------------------------------------------------------------- read/write
@@ -85,7 +85,7 @@ class CredentialStore:
         if ring is not None:
             try:
                 raw = ring.get_password(_SERVICE, self._profile)
-            except Exception:  # noqa: BLE001 - a locked or broken keychain is not fatal
+            except Exception:
                 raw = None
         if raw is None and self._path.exists():
             raw = self._path.read_text(encoding="utf-8")
@@ -103,14 +103,14 @@ class CredentialStore:
         raw = json.dumps(asdict(credentials))
         ring = self._keyring()
         if ring is not None:
-            try:
+            # A locked or broken keychain falls through to the file, which is the
+            # documented behaviour; there is nothing actionable to log.
+            with suppress(Exception):
                 ring.set_password(_SERVICE, self._profile, raw)
                 # Remove any earlier file copy, so the token does not survive on
                 # disk once the keychain is holding it.
                 self._path.unlink(missing_ok=True)
                 return
-            except Exception:  # noqa: BLE001 - fall through to the file
-                pass
 
         self._dir.mkdir(parents=True, exist_ok=True)
         # Written to a sibling temp file and renamed, because `os.replace` is
@@ -138,10 +138,9 @@ class CredentialStore:
     def clear(self) -> None:
         ring = self._keyring()
         if ring is not None:
-            try:
+            # Nothing stored is the desired end state either way.
+            with suppress(Exception):
                 ring.delete_password(_SERVICE, self._profile)
-            except Exception:  # noqa: BLE001 - nothing stored is the desired state
-                pass
         self._path.unlink(missing_ok=True)
 
     # -------------------------------------------------------------------- lock

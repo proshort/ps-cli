@@ -146,9 +146,9 @@ def emit_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]]) -> No
     # A single runaway field should not push every other column off screen.
     widths = [min(w, 48) for w in widths]
 
-    sys.stdout.write("  ".join(h.ljust(w)[:w] for h, w in zip(header, widths)) + "\n")
+    sys.stdout.write("  ".join(h.ljust(w)[:w] for h, w in zip(header, widths, strict=True)) + "\n")
     for line in body:
-        sys.stdout.write("  ".join(c.ljust(w)[:w] for c, w in zip(line, widths)) + "\n")
+        sys.stdout.write("  ".join(c.ljust(w)[:w] for c, w in zip(line, widths, strict=True)) + "\n")
 
 
 def _cell(value: Any) -> str:

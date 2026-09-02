@@ -32,7 +32,11 @@ classifiers = [
 Source = "https://github.com/proshort/ps-cli"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+# `ruff` is pinned exactly, not floated. It is a linter whose *default rule set*
+# changes between minor versions -- 0.16 widened it, which broke CI on code that
+# had not changed and that 0.15 passed clean. A lint failure should mean someone
+# wrote something, not that a tool moved.
+dev = ["pytest>=8", "ruff==0.16.5"]
 
 [project.scripts]
 # `proshort` only, deliberately. `ps` collides with the POSIX process tool, and
@@ -51,6 +55,30 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 110
+
+[tool.ruff.lint]
+# Declared, not inherited. Relying on ruff's defaults means the rule set is
+# whatever the installed version happens to think today; naming the families
+# makes an upgrade a visible decision rather than a red build.
+select = [
+    "E4", "E7", "E9", "F",  # pycodestyle essentials + pyflakes (ruff's own default)
+    "I",                     # import order -- churn-free and keeps diffs small
+    "B",                     # bugbear: real mistakes, not style
+    "C4",                    # comprehension/literal clarity
+    "SIM",                   # simplifications that usually mean a leak or a bug
+    "S",                     # bandit: this program handles credentials
+    "RUF",                   # ruff's own, including unused-noqa
+]
+
+[tool.ruff.lint.per-file-ignores]
+# A test asserts, uses obviously-fake secrets, and shells out on purpose. Bandit
+# is right about all three in `src/` and wrong about them here.
+"tests/*" = [
+    "S101",  # assert -- the point of the file
+    "S105",  # "hardcoded password" -- fixture tokens like psmcp_at_a
+    "S106",  # the same, passed as an argument
+    "S603",  # subprocess without shell=False review -- the lock test needs a real process
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

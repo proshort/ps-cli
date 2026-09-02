@@ -18,15 +18,15 @@ import httpx
 
 from proshort_cli import oauth
 from proshort_cli.errors import (
-    CliError,
     EXIT_ERROR,
+    CliError,
     InsufficientScope,
     NotAuthenticated,
     RateLimited,
     Unavailable,
 )
 from proshort_cli.render import note
-from proshort_cli.store import CredentialStore, Credentials
+from proshort_cli.store import Credentials, CredentialStore
 
 # Well above the server's 128KB response ceiling, so this only fires on
 # something genuinely wrong rather than on a large legitimate page.

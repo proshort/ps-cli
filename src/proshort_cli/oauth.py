@@ -34,10 +34,11 @@ import secrets
 import time
 import urllib.parse
 import webbrowser
+from typing import ClassVar
 
 import httpx
 
-from proshort_cli.errors import CliError, EXIT_AUTH
+from proshort_cli.errors import EXIT_AUTH, CliError
 from proshort_cli.render import note
 
 DEFAULT_CLIENT_ID = "proshort-cli"
@@ -60,10 +61,13 @@ def _pkce() -> tuple[str, str]:
 class _Catcher(http.server.BaseHTTPRequestHandler):
     """Answers callbacks. Stores only one that belongs to this flow."""
 
-    expected_state: str = ""
-    result: dict[str, str] = {}
+    # ClassVar, and deliberately so: this is how the handler hands a result back
+    # to the loop that is serving it. Pinned to the class rather than the
+    # instance because a fresh handler is constructed per request.
+    expected_state: ClassVar[str] = ""
+    result: ClassVar[dict[str, str]] = {}
 
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's interface
+    def do_GET(self) -> None:
         # Loopback only. The redirect is registered as 127.0.0.1, so a request
         # arriving under any other Host reached us some other way and has no
         # business being answered with a page that carries a code.

@@ -9,14 +9,15 @@ reading a table and a script running `| jq`, without a flag and without
 import argparse
 import os
 import sys
-from urllib.parse import quote
 import time
+from contextlib import suppress
+from urllib.parse import quote
 
 from proshort_cli import oauth, render
 from proshort_cli.api import Client
-from proshort_cli.errors import CliError, EXIT_OK, EXIT_USAGE
+from proshort_cli.errors import EXIT_OK, EXIT_USAGE, CliError
 from proshort_cli.render import emit_json, emit_table, note
-from proshort_cli.store import CredentialStore, Credentials
+from proshort_cli.store import Credentials, CredentialStore
 
 # Deliberately no default. The previous one was `*.internal.proshort.ai`, which a
 # customer's machine cannot resolve at all -- so the first `proshort login` failed
@@ -131,15 +132,16 @@ def cmd_logout(args) -> int:
     existing = store.load()
     revoked = False
     if existing is not None:
-        try:
+        # Suppressed rather than caught-and-ignored: revocation is best effort by
+        # design and the outcome is reported below, so there is nothing to log
+        # here that the user is not about to be told.
+        with suppress(Exception):
             oauth.revoke(
                 base_url=existing.base_url,
                 client_id=existing.client_id,
                 token=existing.refresh_token,
             )
             revoked = True
-        except Exception:  # noqa: BLE001 - never block the local clear
-            pass
     store.clear()
     if existing is not None and not revoked:
         note("\u2713 signed out locally \u2014 could not reach Proshort to revoke the session")

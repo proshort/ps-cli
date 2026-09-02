@@ -19,18 +19,18 @@ from proshort_cli.errors import (
     InsufficientScope,
     NotAuthenticated,
 )
-from proshort_cli.store import CredentialStore, Credentials
+from proshort_cli.store import Credentials, CredentialStore
 
 
 def _creds(**over) -> Credentials:
-    base = dict(
-        access_token="psmcp_at_a",
-        refresh_token="psmcp_rt_a",
-        expires_at=time.time() + 600,
-        scopes=["deals:read"],
-        base_url="https://example.invalid",
-        client_id="proshort-cli",
-    )
+    base = {
+        "access_token": "psmcp_at_a",
+        "refresh_token": "psmcp_rt_a",
+        "expires_at": time.time() + 600,
+        "scopes": ["deals:read"],
+        "base_url": "https://example.invalid",
+        "client_id": "proshort-cli",
+    }
     base.update(over)
     return Credentials(**base)
 
