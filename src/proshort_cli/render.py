@@ -40,6 +40,27 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 # Newline and tab. Stripped only where the output has one line per record.
 _LAYOUT = re.compile(r"[\t\n\r\x0b\x0c\u2028\u2029]+")
 
+# Bidirectional overrides and isolates. Not escape sequences and not layout --
+# a third kind of forgery, and the one left standing after the other two were
+# closed.
+#
+# These reorder the *visible* text without changing a byte of it. A deal named
+#
+#     Acme Corp\u202e000,000$2
+#
+# renders in a terminal as `Acme Corp$2,000,000`, and no amount of stripping
+# control characters or collapsing newlines touches it: the reader sees a number
+# that is not in the data, and a person auditing the row by eye cannot tell.
+# It is the same trick as the "Trojan Source" attack on code review, pointed at
+# a table cell.
+#
+# Removed rather than replaced, unlike the layout class: an override is a
+# formatting instruction with no width of its own, so deleting it leaves the
+# surrounding words exactly as they were written. This applies to *both* entry
+# points -- a paragraph of prose can be reordered as easily as a cell, so unlike
+# `_LAYOUT` this one is not the line form's alone.
+_BIDI = re.compile(r"[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]")
+
 # ANSI escape sequences: CSI (cursor movement, colour, erase), OSC (window title,
 # hyperlinks -- terminated by BEL or ST), and the short two-character forms.
 _ANSI = re.compile(
@@ -59,8 +80,13 @@ def sanitize(value: str) -> str:
     Newline and tab survive here, because this is the prose form -- a call recap
     or a deal summary keeps its paragraphs. Anywhere the output is one line per
     record, use `sanitize_line`.
+
+    Bidi overrides do not survive, in either form. They are not layout in the
+    sense `sanitize_line` means -- they forge the *content* of a line rather than
+    the number of lines -- and a reordered sentence in a call summary is as much
+    a lie as a reordered table cell.
     """
-    return _CONTROL.sub("", _ANSI.sub("", value))
+    return _BIDI.sub("", _CONTROL.sub("", _ANSI.sub("", value)))
 
 
 def sanitize_line(value: str) -> str:

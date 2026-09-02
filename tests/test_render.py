@@ -7,6 +7,8 @@ what it reads. These tests are the control.
 import io
 import json
 
+import pytest
+
 from proshort_cli import render
 
 
@@ -95,3 +97,44 @@ def test_global_flags_work_on_either_side_of_the_subcommand():
     # And on a nested subcommand.
     assert parser.parse_args(["deals", "list", "--json"]).json is True
     assert parser.parse_args(["--timeout", "5", "deals", "list"]).timeout == 5
+
+
+# ------------------------------------------------------------- bidi overrides
+
+
+def test_a_bidi_override_cannot_forge_a_table_cell():
+    """The forgery left standing after escape sequences and newlines were closed.
+
+    These reorder the *visible* text without changing a byte, so neither
+    stripping controls nor collapsing newlines touches them. `Acme
+    Corp\\u202e000,000$2` renders as `Acme Corp$2,000,000` in a terminal, and a
+    person auditing the row by eye has no way to tell. Same trick as the "Trojan
+    Source" attack on code review, pointed at a table cell.
+    """
+    forged = "Acme Corp‮000,000$2"
+    assert render.sanitize_line(forged) == "Acme Corp000,000$2"
+
+
+@pytest.mark.parametrize(
+    "codepoint",
+    ["‪", "‫", "‬", "‭", "‮", "⁦", "⁧", "⁨", "⁩"],
+)
+def test_every_bidi_override_and_isolate_is_stripped(codepoint):
+    assert codepoint not in render.sanitize_line(f"a{codepoint}b")
+    # The prose form too: a reordered sentence in a call summary is as much a lie
+    # as a reordered cell, and only the *layout* class is the line form's alone.
+    assert codepoint not in render.sanitize(f"a{codepoint}b")
+
+
+def test_stripping_an_override_does_not_join_the_words_around_it():
+    """Removed rather than replaced with a space, unlike the layout class: an
+    override has no width of its own, so deleting it leaves the text as written."""
+    assert render.sanitize_line("Acme‎Corp") == "AcmeCorp"
+
+
+def test_json_output_still_carries_the_bytes_the_server_sent(capsys):
+    """Same rule as every other class here: machine output is escaped by the JSON
+    encoder, which is lossless, and altering data on its way into a file would be
+    a different and worse bug."""
+    render.emit_json({"name": "Acme‮Corp"})
+    assert "\\u202e" in capsys.readouterr().out

@@ -262,35 +262,55 @@ def test_an_error_body_that_is_not_an_object_does_not_traceback(client, monkeypa
 
 
 def test_a_non_json_body_does_not_traceback(client, monkeypatch):
-    bad = httpx.Response(
-        500, content=b"<html>gateway</html>",
-        request=httpx.Request("GET", "https://example.invalid/v1/deals"),
+    _queue(
+        monkeypatch,
+        [
+            httpx.Response(
+                500,
+                content=b"<html>gateway</html>",
+                request=httpx.Request("GET", "https://example.invalid/v1/deals"),
+            )
+        ],
     )
-    monkeypatch.setattr(api.httpx, "get", lambda url, **kw: bad)
     with pytest.raises(CliError) as caught:
         client.get("/v1/deals")
     assert caught.value.code == EXIT_UNAVAILABLE
 
 
 def test_an_unreachable_host_reports_unavailable(client, monkeypatch):
-    def boom(url, **kwargs):
+    def boom(_method, _url, **_kwargs):
         raise httpx.ConnectError("nope")
 
-    monkeypatch.setattr(api.httpx, "get", boom)
+    monkeypatch.setattr(api.httpx, "stream", boom)
     with pytest.raises(CliError) as caught:
         client.get("/v1/deals")
     assert caught.value.code == EXIT_UNAVAILABLE
 
 
-def test_an_oversized_body_is_refused(client, monkeypatch):
-    huge = httpx.Response(
-        200, content=b"x" * (api.MAX_RESPONSE_BYTES + 1),
-        request=httpx.Request("GET", "https://example.invalid/v1/deals"),
-    )
-    monkeypatch.setattr(api.httpx, "get", lambda url, **kw: huge)
+def test_a_declared_oversized_body_is_refused_before_it_is_read(client, monkeypatch):
+    """`Content-Length` is checked before the first chunk.
+
+    Written so it fails if only the streaming ceiling is doing the work: the
+    declared length is over the cap and the actual body is a single byte, so the
+    only way to refuse it is to have read the header. Otherwise this is just a
+    slower copy of the streamed test below.
+    """
+    read = False
+
+    class _Declaring:
+        status_code = 200
+        headers = httpx.Headers({"Content-Length": str(api.MAX_RESPONSE_BYTES + 1)})
+
+        def iter_bytes(self, chunk_size=None):
+            nonlocal read
+            read = True
+            yield b"x"
+
+    monkeypatch.setattr(api.httpx, "stream", lambda *_a, **_k: _Streamed(_Declaring()))
     with pytest.raises(CliError) as caught:
         client.get("/v1/deals")
     assert caught.value.code == EXIT_UNAVAILABLE
+    assert read is False, "the body was read despite a Content-Length over the cap"
 
 
 def test_the_bearer_header_is_the_only_thing_carrying_identity(client, monkeypatch):
@@ -499,3 +519,15 @@ def test_a_stored_cleartext_address_asks_for_a_sign_in_not_a_retry(tmp_path, mon
     with pytest.raises(CliError) as caught:
         Client(store, timeout=5)
     assert caught.value.code == EXIT_AUTH
+
+
+def test_a_null_page_object_does_not_crash_a_completed_walk(client, monkeypatch):
+    """`setdefault` returns the existing value, so an explicit `"page": null` came
+    back as `None` and `None["returned"]` was a TypeError -- raised *after* a
+    complete, successful walk, on the one command whose whole argument is that it
+    never returns quietly wrong results.
+    """
+    _queue(monkeypatch, [_response(200, {"data": [{"id": 1}], "page": None})])
+    body = client.get_all("/v1/deals", [])
+    assert body["page"]["returned"] == 1
+    assert [row["id"] for row in body["data"]] == [1]

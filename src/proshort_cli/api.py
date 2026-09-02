@@ -125,10 +125,15 @@ class Client:
                 # the opposite of the check that guards it -- and quietly carrying
                 # a spent token forward is the one outcome worth never guessing at.
                 refresh_token=payload["refresh_token"],
-                expires_at=time.time() + int(payload.get("expires_in", 600)),
+                # `_token_payload` has already coerced this to a positive int, so
+                # a `null` on the wire cannot arrive here as `int(None)`.
+                expires_at=time.time() + payload["expires_in"],
                 scopes=(payload.get("scope") or " ".join(current.scopes)).split(),
                 base_url=current.base_url,
                 client_id=current.client_id,
+                # Carried forward so `save` can bump past it even when the
+                # keychain is unreadable and cannot report what it holds.
+                generation=current.generation,
             )
             self._store.save(self._credentials)
 
@@ -185,6 +190,10 @@ class Client:
                     "User-Agent": "proshort-cli",
                 },
                 timeout=self._remaining(),
+                # Already the httpx default. Pinned because this request carries a
+                # bearer token, and a 302 must not be allowed to carry it to a
+                # second host.
+                follow_redirects=False,
             ) as response:
                 declared = response.headers.get("Content-Length")
                 if declared and declared.isdigit() and int(declared) > MAX_RESPONSE_BYTES:
@@ -286,7 +295,14 @@ class Client:
                 )
             page += 1
         first[rows_key] = merged
-        first.setdefault("page", {})["returned"] = len(merged)
+        # `setdefault` returns the existing value, so an explicit `"page": null`
+        # came back as `None` and `None["returned"]` was a TypeError -- a
+        # traceback and exit 1 raised *after* a complete, successful walk, on the
+        # one command whose whole argument is that it never returns quietly wrong
+        # results.
+        page = first.get("page")
+        first["page"] = page if isinstance(page, dict) else {}
+        first["page"]["returned"] = len(merged)
         return first
 
 

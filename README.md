@@ -21,6 +21,10 @@ uv tool install git+https://github.com/proshort/ps-cli
 resolves to nothing. Install from the repository until distribution is decided;
 the name is reserved by nobody and the line above is the one that works today.
 
+Running from a clone rather than an install is fine, but `proshort --version`
+reads the *installed* package metadata and will report `0.0.0+source`. Use
+`uv pip install -e .` in the clone if you need the real number.
+
 **macOS and Linux only in 0.1.0.** The refresh lock uses `fcntl`, so importing
 this on Windows fails. A port needs `msvcrt.locking` behind the same interface -
 not a large change, just not this one.

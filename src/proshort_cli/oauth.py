@@ -184,11 +184,15 @@ def login(
         params["scope"] = " ".join(scopes)
     authorize_url = f"{base_url}/authorize?{urllib.parse.urlencode(params)}"
 
-    note(f"\u2192 opened your browser \u00b7 listening on 127.0.0.1:{port}")
-    if open_browser:
-        webbrowser.open(authorize_url)
+    opened = webbrowser.open(authorize_url) if open_browser else False
+    if opened:
+        note(f"\u2192 opened your browser \u00b7 listening on 127.0.0.1:{port}")
     else:
-        note(f"  open this to continue:\n  {authorize_url}")
+        # `webbrowser.open` returns False on a headless box, over SSH, or with no
+        # handler registered. Announcing a browser that never opened and then
+        # waiting out the whole timeout is the least useful thing this could do.
+        note(f"\u2192 listening on 127.0.0.1:{port} \u00b7 open this to continue:")
+        note(f"  {authorize_url}")
 
     try:
         result = _serve_until_callback(server, max(1, int(deadline - time.monotonic())))
@@ -277,7 +281,13 @@ def _post_token(*, base_url: str, data: dict, what: str, timeout: int) -> dict:
     """
     try:
         response = httpx.post(
-            f"{base_url.rstrip('/')}/token", data=data, timeout=max(1, timeout)
+            f"{base_url.rstrip('/')}/token",
+            data=data,
+            timeout=max(1, timeout),
+            # Already the default. Pinned because this request carries the
+            # `code_verifier` or the refresh token, and a 302 must not be able to
+            # deliver either to a second host.
+            follow_redirects=False,
         )
     except httpx.RequestError as exc:
         raise Unavailable(f"Could not reach Proshort: {exc.__class__.__name__}.") from exc
@@ -355,11 +365,27 @@ def _token_payload(response: "httpx.Response", what: str) -> dict:
     # something is wrong on the server, and saying so is better than carrying the
     # old token forward and being revoked as a thief on the call after next.
     # `api._refresh_locked` indexes this directly on the strength of this check.
+    #
+    # `Unavailable`, not `EXIT_AUTH`. A 200 that does not carry a usable grant is
+    # the *server* failing, and telling the user to sign in again sends them to
+    # redo something that was never the problem -- the same misclassification
+    # `_post_token` exists to stop, applied to the other side of the same call.
     for required in ("access_token", "refresh_token"):
-        if not isinstance(payload.get(required), str):
-            raise CliError(
-                f"The {what} response was missing {required}.", EXIT_AUTH
-            )
+        if not isinstance(payload.get(required), str) or not payload[required]:
+            raise Unavailable(f"Proshort's {what} response was missing {required}.")
+
+    # Coerced here so every caller can index a real int. `.get("expires_in", 600)`
+    # defaults only when the key is *absent*: an explicit `null` became
+    # `int(None)`, which is a TypeError escaping as a traceback and exit 1 -- and
+    # it does it on the silent ten-minute refresh, where nobody is watching.
+    lifetime = payload.get("expires_in", 600)
+    if isinstance(lifetime, bool) or not isinstance(lifetime, (int, float)) or lifetime <= 0:
+        if lifetime is not None:
+            # A present-but-unusable value is worth refusing; an explicit null is
+            # the server declining to say, which the default already covers.
+            raise Unavailable(f"Proshort's {what} response gave an unusable expires_in.")
+        lifetime = 600
+    payload["expires_in"] = int(lifetime)
     return payload
 
 
@@ -390,4 +416,5 @@ def revoke(*, base_url: str, client_id: str, token: str) -> None:
             "client_secret": "",
         },
         timeout=15,
+        follow_redirects=False,
     ).raise_for_status()

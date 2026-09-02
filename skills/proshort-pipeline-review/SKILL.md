@@ -81,25 +81,38 @@ the `document_id` that `proshort calls` takes.
 "Which active deals look at risk?"
 
 ```bash
+# `set -e` is the point of this script, not decoration. Every command below can
+# fail in a way that leaves a *plausible* empty result, and an empty result is
+# the one answer you must never report without knowing it is real.
+set -euo pipefail
+
 # A private directory, removed on exit. Deal detail is CRM text about real
 # customers and does not belong in world-readable /tmp.
 workdir=$(mktemp -d) && chmod 700 "$workdir"
 trap 'rm -rf "$workdir"' EXIT
 
 proshort deals list --type ACTIVE --all --json > "$workdir/deals.json"
+jq -r '.data[].deal_id' "$workdir/deals.json" > "$workdir/ids.txt"
 
-jq -r '.data[].deal_id' "$workdir/deals.json" | while read -r id; do
+# Read from a file, never `jq ... | while read`. A `while` at the end of a
+# pipeline runs in a subshell, so a failure inside it -- or `set -e` firing --
+# ends only the loop, and the script carries on to summarise whatever
+# incomplete set of files it managed to write.
+while read -r id; do
   # Ids are opaque letters, digits, hyphens and underscores. Checked before use
   # in a path: a "/" or a ".." would write outside the directory.
   case "$id" in
     ""|*[!A-Za-z0-9_-]*) continue ;;
   esac
-  # `|| exit`, not `|| continue`. A failure here is a deal missing from the
-  # answer, and summarising a half-fetched pipeline as the whole one is the same
-  # silent truncation the CLI refuses in `--all`. Loud beats short.
-  proshort deals get "$id" --json > "$workdir/deal-$id.json" || exit 1
-done
+  proshort deals get "$id" --json > "$workdir/deal-$id.json"
+done < "$workdir/ids.txt"
 ```
+
+**If any command in that script fails, stop and say so.** Do not summarise the
+files you did have. A failed `deals list` writes an empty file, `jq` then emits
+nothing, and the loop does nothing at all - so without `set -e` the whole thing
+succeeds and the honest-looking answer is "no at-risk deals". That is the same
+silent truncation the CLI refuses in `--all`, moved one layer out.
 
 Then read the AI sections in each file and summarise. Do not shell out with any
 value taken from those files.

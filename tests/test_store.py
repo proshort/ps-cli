@@ -8,6 +8,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
+
+from proshort_cli.errors import EXIT_USAGE, CliError
 from proshort_cli.store import Credentials, CredentialStore
 
 
@@ -242,3 +245,75 @@ def test_a_planted_temp_file_cannot_become_the_credential_file(tmp_path, monkeyp
 
     assert os.stat(store.path).st_mode & 0o777 == 0o600
     assert not planted.exists() or os.stat(planted).st_mode & 0o777 == 0o666
+
+
+def test_the_newer_pair_wins_even_when_it_expires_sooner(tmp_path, monkeypatch):
+    """The hole in the first version of the dual-store fix.
+
+    It compared `expires_at`, reasoning that a refresh sets it from the clock so
+    the later one must be the newer pair. That is a coincidence, not an
+    invariant: `expires_at` says when the *access token* dies. Step the clock
+    back between two saves, or shorten `expires_in`, and the newer pair carries
+    the smaller number -- so the comparison picks the spent refresh token and the
+    family gets revoked, with a passing test suite saying it cannot.
+
+    Nothing in the old dual-store tests ever inverted the two clocks, which is
+    why they all passed.
+    """
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    ring = _LockableRing()
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: ring)
+    store = CredentialStore("test")
+
+    # Written first, and long-lived.
+    store.save(_creds(refresh_token="rt_old", expires_at=time.time() + 3600))
+    # Written second, and shorter-lived -- the keychain is locked, so it lands in
+    # the file and the stale keychain copy cannot be deleted.
+    ring.locked = True
+    store.save(_creds(refresh_token="rt_new", expires_at=time.time() + 60))
+    ring.locked = False
+
+    loaded = CredentialStore("test").load()
+    assert loaded is not None
+    assert loaded.refresh_token == "rt_new", "recency was decided by expiry, not by write order"
+
+
+def test_a_profile_cannot_escape_the_config_directory(tmp_path, monkeypatch):
+    """`--profile ../../tmp/other` would write a 0600 JSON blob and a lock file
+    wherever it pointed -- the same class of bug as the planted temp file this
+    module already defends against, and the same check the Skill applies to a
+    deal id before putting it in a path.
+    """
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path / "cfg"))
+    for hostile in ("../other", "../../tmp/other", "a/b", "..", ".", "", "with space", "x\x00y"):
+        with pytest.raises(CliError) as caught:
+            CredentialStore(hostile)
+        assert caught.value.code == EXIT_USAGE, hostile
+
+
+def test_ordinary_profile_names_still_work(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path / "cfg"))
+    for good in ("default", "work", "acme-staging", "a.b", "a_b", "Prod2"):
+        assert CredentialStore(good).path.name == f"{good}.json"
+
+
+def test_a_blob_with_the_right_keys_and_wrong_types_is_treated_as_signed_out(tmp_path, monkeypatch):
+    """`Credentials(**data)` raises on a missing or extra key and accepts anything
+    at all for the values, so `{"expires_at": "soon"}` parsed and then threw a
+    TypeError out of `expired()` -- which is exactly what returning None instead
+    of raising was supposed to prevent.
+    """
+    store = _store(tmp_path, monkeypatch)
+    store.save(_creds())
+    for broken in (
+        {"expires_at": "soon"},
+        {"scopes": "deals:read"},
+        {"access_token": None},
+        {"base_url": 12},
+        {"generation": "two"},
+        {"expires_at": True},
+    ):
+        blob = asdict(_creds())
+        blob.update(broken)
+        store.path.write_text(json.dumps(blob), encoding="utf-8")
+        assert store.load() is None, broken

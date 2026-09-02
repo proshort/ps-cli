@@ -24,14 +24,42 @@ that *is* the case the theft signal exists for, and it should still be loud.
 import fcntl
 import json
 import os
+import re
 import time
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from proshort_cli.errors import EXIT_USAGE, CliError
 from proshort_cli.render import note
 
 _SERVICE = "proshort-cli"
+
+# A profile names a file. `--profile ../../tmp/other` would otherwise write a
+# 0600 JSON blob and a lock file wherever it pointed -- the same class of bug as
+# the planted temp file this module already defends against with `O_EXCL` and
+# `O_NOFOLLOW`, and the same check the reference Skill applies to a deal id
+# before putting it in a path.
+_PROFILE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+
+
+_FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
+    "access_token": str,
+    "refresh_token": str,
+    "expires_at": (int, float),
+    "scopes": list,
+    "base_url": str,
+    "client_id": str,
+    "generation": int,
+}
+
+
+def _check_profile(profile: str) -> None:
+    if profile in (".", "..") or not _PROFILE.match(profile):
+        raise CliError(
+            f"--profile must be letters, digits, dot, dash or underscore; got {profile!r}.",
+            EXIT_USAGE,
+        )
 
 
 def config_dir() -> Path:
@@ -44,10 +72,18 @@ class Credentials:
     refresh_token: str
     # Absolute epoch seconds. Stored rather than a duration so a process that
     # starts hours later does not think a stale token is fresh.
+    #
+    # **Not a recency signal.** This says when the *access token* dies, which is
+    # a different question from which of two stored blobs was written last --
+    # see `generation` and `CredentialStore.load`.
     expires_at: float
     scopes: list[str]
     base_url: str
     client_id: str
+    # Which write this pair came from. Defaulted so a credential file written
+    # before this field existed still parses, as generation 0 -- the oldest
+    # possible, which is the safe direction for the comparison in `load`.
+    generation: int = 0
 
     def expired(self, *, skew: int = 30) -> bool:
         # A little early, so a token does not expire in flight between the check
@@ -59,10 +95,16 @@ class CredentialStore:
     """Keychain when there is one, a 0600 file when there is not."""
 
     def __init__(self, profile: str = "default") -> None:
+        _check_profile(profile)
         self._profile = profile
         self._dir = config_dir()
         self._path = self._dir / f"{profile}.json"
         self._lock_path = self._dir / f"{profile}.lock"
+        # Belt to the regex's braces, and it catches what a character class
+        # cannot: a `PROSHORT_CONFIG_DIR` that is itself a symlink out of where
+        # the caller thinks they are.
+        if self._path.resolve().parent != self._dir.resolve():
+            raise CliError(f"--profile {profile!r} does not stay inside {self._dir}.", EXIT_USAGE)
 
     @property
     def path(self) -> Path:
@@ -80,14 +122,33 @@ class CredentialStore:
     # --------------------------------------------------------------- read/write
 
     def _parse(self, raw: str | None) -> Credentials | None:
+        """Decode one stored blob, or `None` if it is not one.
+
+        Types are checked, not just keys. `Credentials(**data)` raises on an
+        *extra* or *missing* key and accepts anything at all for the values, so
+        `{"expires_at": "soon"}` parsed happily and then threw a `TypeError` out
+        of `expired()` or out of the comparison in `load` -- which contradicts
+        the whole reason this returns `None` instead of raising. A corrupt copy
+        must cost a sign-in, never a traceback.
+        """
         if not raw:
             return None
         try:
-            return Credentials(**json.loads(raw))
-        except (json.JSONDecodeError, TypeError):
-            # A corrupt copy is not a reason to crash every command, and it must
-            # not shadow a good copy in the other store either -- hence a value
-            # per source rather than one shared `raw`.
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        for name, kinds in _FIELD_TYPES.items():
+            value = data.get(name)
+            if name == "generation" and value is None:
+                continue  # written before the field existed
+            # `bool` is a subclass of `int`, and `True` is not an expiry.
+            if isinstance(value, bool) or not isinstance(value, kinds):
+                return None
+        try:
+            return Credentials(**data)
+        except TypeError:
             return None
 
     def load(self) -> Credentials | None:
@@ -105,20 +166,59 @@ class CredentialStore:
            to do about a spent refresh token and revokes the whole family.
 
         The refresh lock cannot help: both processes agree on the same stale
-        keychain value. Two stores only work if one of them is authoritative, and
-        `expires_at` is what says which -- every refresh sets it from the clock,
-        so the later one is always the newer pair. `save` also drops the keychain
-        copy when it falls back to the file, which fixes it at the source; this
-        fixes it when even that delete could not run.
+        keychain value. Two stores only work if one of them is authoritative.
+
+        **`generation`, not `expires_at`.** The first version of this compared
+        expiry, on the reasoning that a refresh sets it from the clock so the
+        later one must be the newer pair. That is a coincidence, not an
+        invariant: `expires_at` answers "when does this access token die", and
+        the two only move together when every refresh happens near expiry and
+        `expires_in` never changes. `_refresh_locked` exists precisely because
+        neither holds -- it refreshes a token that still looks fresh locally, on
+        a 401 caused by a server-side revocation or a clock skew. Step the clock
+        backwards between two saves, or shorten `expires_in`, and the *newer*
+        pair carries the *smaller* number. The comparison then picks the spent
+        refresh token, and the outage this whole mechanism exists to prevent
+        happens anyway, now with a test suite saying it cannot.
+
+        A counter has no clock in it at all. `save` reads the highest generation
+        in either store and writes one above it, under the same lock the refresh
+        takes, so the answer to "which was written last" is recorded rather than
+        inferred.
+
+        **Ties go to the file**, and that is an invariant rather than a
+        preference. `save` writes the file only when the keychain write failed,
+        and deletes the file whenever the keychain write succeeded -- so the two
+        existing at once means the keychain lost. The tie is reachable because a
+        locked keychain is unreadable as well as unwritable: `_next_generation`
+        cannot see the number it needs to beat, so the fallback write can land on
+        the same one. That is precisely the case this method exists for, so it
+        had better not be the case it gets wrong.
         """
-        found = [
-            self._parse(self._from_keyring()),
-            self._parse(self._path.read_text(encoding="utf-8") if self._path.exists() else None),
-        ]
-        live = [c for c in found if c is not None]
-        if not live:
+        file_copy = self._parse(self._read_file())
+        keychain_copy = self._parse(self._from_keyring())
+        live = [(1, file_copy), (0, keychain_copy)]
+        candidates = [(gen_break, c) for gen_break, c in live if c is not None]
+        if not candidates:
             return None
-        return max(live, key=lambda c: c.expires_at)
+        return max(candidates, key=lambda pair: (pair[1].generation, pair[0]))[1]
+
+    def _read_file(self) -> str | None:
+        return self._path.read_text(encoding="utf-8") if self._path.exists() else None
+
+    def _both(self) -> list[Credentials | None]:
+        return [self._parse(self._from_keyring()), self._parse(self._read_file())]
+
+    def _next_generation(self, at_least: int = 0) -> int:
+        """One above everything visible, and above what the caller already held.
+
+        `at_least` is the generation of the pair being replaced. It matters when a
+        store is unreadable rather than empty -- a locked keychain hides the
+        number to beat, and without this the fallback write would restart the
+        count and collide with the copy it is meant to supersede.
+        """
+        seen = [c.generation for c in self._both() if c is not None]
+        return max([at_least, *seen], default=0) + 1
 
     def _from_keyring(self) -> str | None:
         ring = self._keyring()
@@ -130,6 +230,13 @@ class CredentialStore:
             return None
 
     def save(self, credentials: Credentials, *, announce: bool = False) -> None:
+        """Persist a pair, stamped one generation above anything already stored.
+
+        Mutates the argument rather than copying it: the caller holds this object
+        as its in-memory view of the session, and a stored generation the caller
+        does not know about is a second source of truth waiting to disagree.
+        """
+        credentials.generation = self._next_generation(at_least=credentials.generation)
         raw = json.dumps(asdict(credentials))
         ring = self._keyring()
         if ring is not None:

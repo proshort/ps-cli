@@ -124,9 +124,9 @@ def test_revocation_sends_the_field_the_server_requires(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def fake_post(url, data=None, timeout=None):
+    def fake_post(url, **kwargs):
         sent["url"] = url
-        sent["data"] = data
+        sent.update(kwargs)
         return _Ok()
 
     monkeypatch.setattr(oauth.httpx, "post", fake_post)
@@ -136,6 +136,8 @@ def test_revocation_sends_the_field_the_server_requires(monkeypatch):
     assert sent["data"]["client_secret"] == ""
     assert sent["data"]["token"] == "psmcp_rt_x"
     assert sent["data"]["token_type_hint"] == "refresh_token"
+    # A 302 must not be able to carry the refresh token to a second host.
+    assert sent["follow_redirects"] is False
 
 
 # --------------------------------------------------- the token plane's exit codes
@@ -297,3 +299,59 @@ def test_signing_in_does_not_wait_on_reverse_dns(monkeypatch):
     with pytest.raises(CliError) as caught:
         oauth.login(base_url="https://example.invalid", timeout=1, open_browser=False)
     assert "Timed out" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"access_token": "at"},
+        {"access_token": "at", "refresh_token": ""},
+        {"access_token": "at", "refresh_token": 5},
+    ],
+)
+def test_a_200_without_a_usable_grant_is_the_servers_fault(monkeypatch, payload):
+    """This used to be exit 3, which tells a Skill to say "run proshort login"
+    about a server bug. It is the same misclassification `_post_token` exists to
+    stop, applied to the other side of the same call."""
+    _post_returning(monkeypatch, _token_response(200, payload))
+    with pytest.raises(CliError) as caught:
+        oauth.refresh(base_url="https://example.invalid", client_id="c", refresh_token="r")
+    assert caught.value.code == EXIT_UNAVAILABLE
+
+
+def test_a_null_expires_in_does_not_become_int_none(monkeypatch):
+    """`.get("expires_in", 600)` defaults only when the key is *absent*. An
+    explicit null became `int(None)` -- a TypeError, on the silent ten-minute
+    refresh, where nobody is watching."""
+    _post_returning(
+        monkeypatch,
+        _token_response(200, {"access_token": "at", "refresh_token": "rt", "expires_in": None}),
+    )
+    payload = oauth.refresh(base_url="https://example.invalid", client_id="c", refresh_token="r")
+    assert payload["expires_in"] == 600
+
+
+@pytest.mark.parametrize("lifetime", ["ten minutes", 0, -1, True])
+def test_an_unusable_expires_in_is_refused_rather_than_guessed(monkeypatch, lifetime):
+    _post_returning(
+        monkeypatch,
+        _token_response(
+            200, {"access_token": "at", "refresh_token": "rt", "expires_in": lifetime}
+        ),
+    )
+    with pytest.raises(CliError) as caught:
+        oauth.refresh(base_url="https://example.invalid", client_id="c", refresh_token="r")
+    assert caught.value.code == EXIT_UNAVAILABLE
+
+
+def test_the_url_is_printed_when_the_browser_does_not_open(monkeypatch, capsys):
+    """`webbrowser.open` returns False on a headless box or over SSH. Announcing
+    a browser that never opened and then waiting out the whole timeout is the
+    least useful thing this could do."""
+    monkeypatch.setattr(oauth.webbrowser, "open", lambda _url: False)
+    monkeypatch.setattr(oauth, "_serve_until_callback", lambda _server, _timeout: {})
+    with pytest.raises(CliError):
+        oauth.login(base_url="https://example.invalid", timeout=1, open_browser=True)
+    printed = capsys.readouterr().err
+    assert "opened your browser" not in printed
+    assert "/authorize?" in printed

@@ -51,6 +51,23 @@ def _repeat(values, name):
     return [(name, v) for v in (values or [])]
 
 
+def positive_int(raw: str) -> int:
+    """`type=int` accepts `-1`, and the help text promises otherwise.
+
+    A negative `--timeout` makes the command deadline expire before the first
+    request, which surfaces as "Proshort is unavailable" -- a wrong answer about
+    somebody else. A negative `--limit` is the server's problem to refuse, and
+    making it ours is cheaper than a round trip to be told.
+    """
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not a whole number.") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or greater, not {value}.")
+    return value
+
+
 # --------------------------------------------------------------------- commands
 
 
@@ -95,38 +112,50 @@ def cmd_login(args) -> int:
         base_url=base_url,
         client_id=args.client_id,
         scopes=scopes,
-        timeout=args.timeout or LOGIN_TIMEOUT,
+        timeout=LOGIN_TIMEOUT if args.timeout is None else args.timeout,
         open_browser=not args.no_browser,
     )
-    # The new grant exists, so the old one is now a second live credential for
-    # the same person that nobody will ever use again -- and `logout` was the
-    # only thing that ever killed one. Signing in twice therefore left a
-    # thirty-day refresh token behind every time, which is precisely what
-    # somebody who copied the credentials file is counting on.
-    #
-    # Revoked *after* the exchange, never before: a sign-in that fails partway
-    # must leave the user with the session they already had. Different families,
-    # so this cannot touch the grant just issued. Best-effort, like `logout`.
-    if existing is not None:
-        with suppress(Exception):
-            oauth.revoke(
-                base_url=existing.base_url,
-                client_id=existing.client_id,
-                token=existing.refresh_token,
-            )
-
     granted = (payload.get("scope") or " ".join(scopes)).split()
-    store.save(
-        announce=True,
-        credentials=Credentials(
-            access_token=payload["access_token"],
-            refresh_token=payload["refresh_token"],
-            expires_at=time.time() + int(payload.get("expires_in", 600)),
-            scopes=granted,
-            base_url=base_url,
-            client_id=args.client_id,
-        ),
-    )
+
+    # Revoke-then-replace, under the same lock a refresh takes, and on a *re-read*
+    # of what is on disk right now -- not on `existing`, which was loaded before
+    # a browser wait that can last five minutes.
+    #
+    # Both halves matter. Without the lock, a concurrent command can rotate the
+    # family between the re-read and the save, and either (a) this revokes a
+    # token that has already been spent, which is the server's theft signal, so
+    # it kills the family that command just stored, or (b) that command's save
+    # lands after this one and overwrites the new grant with a pair this login
+    # has already revoked. Without the re-read, (a) happens every time somebody
+    # runs a command while the browser is open.
+    #
+    # The browser wait is deliberately *outside* the lock: holding it for five
+    # minutes would block every other command on the machine.
+    with store.refresh_lock():
+        superseded = store.load()
+        store.save(
+            announce=True,
+            credentials=Credentials(
+                access_token=payload["access_token"],
+                refresh_token=payload["refresh_token"],
+                # `_token_payload` guarantees a positive int.
+                expires_at=time.time() + payload["expires_in"],
+                scopes=granted,
+                base_url=base_url,
+                client_id=args.client_id,
+                generation=superseded.generation if superseded else 0,
+            ),
+        )
+        # After the save, never before: a failure here must not leave the user
+        # with neither session. The new grant is a different family, so revoking
+        # the old one cannot touch it. Best-effort, like `logout`.
+        if superseded is not None and superseded.refresh_token != payload["refresh_token"]:
+            with suppress(Exception):
+                oauth.revoke(
+                    base_url=superseded.base_url,
+                    client_id=superseded.client_id,
+                    token=superseded.refresh_token,
+                )
 
     # The grant is real and stored from here on. Naming the user is a courtesy,
     # so a failure past this point must not look like a failed sign-in -- which
@@ -150,20 +179,26 @@ def cmd_logout(args) -> int:
     logged out" was not true of anything except this machine's copy.
     """
     store = CredentialStore(args.profile)
-    existing = store.load()
     revoked = False
-    if existing is not None:
-        # Suppressed rather than caught-and-ignored: revocation is best effort by
-        # design and the outcome is reported below, so there is nothing to log
-        # here that the user is not about to be told.
-        with suppress(Exception):
-            oauth.revoke(
-                base_url=existing.base_url,
-                client_id=existing.client_id,
-                token=existing.refresh_token,
-            )
-            revoked = True
-    store.clear()
+    # Under the refresh lock, and loaded inside it: without that, a concurrent
+    # refresh can rotate the family between the load and the revoke, and this
+    # would present a spent token -- which the server reads as theft, and which
+    # is a strange way to end a session the user asked to end politely. It also
+    # stops that refresh from writing the credentials back after `clear()`.
+    with store.refresh_lock():
+        existing = store.load()
+        if existing is not None:
+            # Suppressed rather than caught-and-ignored: revocation is best effort
+            # by design and the outcome is reported below, so there is nothing to
+            # log here that the user is not about to be told.
+            with suppress(Exception):
+                oauth.revoke(
+                    base_url=existing.base_url,
+                    client_id=existing.client_id,
+                    token=existing.refresh_token,
+                )
+                revoked = True
+        store.clear()
     if existing is not None and not revoked:
         note("\u2713 signed out locally \u2014 could not reach Proshort to revoke the session")
     else:
@@ -173,7 +208,8 @@ def cmd_logout(args) -> int:
 
 def cmd_whoami(args) -> int:
     body = Client(
-        CredentialStore(args.profile), timeout=args.timeout or DEFAULT_TIMEOUT
+        CredentialStore(args.profile),
+        timeout=DEFAULT_TIMEOUT if args.timeout is None else args.timeout,
     ).get("/v1/me")
     return _emit(args, body, table=None, single=True)
 
@@ -255,7 +291,11 @@ LOGIN_TIMEOUT = 300
 def _client(args) -> Client:
     return Client(
         CredentialStore(args.profile),
-        timeout=args.timeout or DEFAULT_TIMEOUT,
+        # `is None`, not `or`: `or` reads every falsy value as "unset", so
+        # `--timeout 0` silently became 60. `positive_int` refuses 0 at the
+        # parser now, but an idiom that is only correct because something else
+        # rejects its bad case is one edit away from being wrong again.
+        timeout=DEFAULT_TIMEOUT if args.timeout is None else args.timeout,
         verbose=args.verbose,
     )
 
@@ -317,7 +357,7 @@ def _add_global_flags(parser: argparse.ArgumentParser, *, top: bool) -> None:
     # not offering it.
     parser.add_argument(
         "--timeout",
-        type=int,
+        type=positive_int,
         default=default(None),
         help="Seconds to spend, including waits (default: 60; 300 for login).",
     )
@@ -359,7 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--q", help="Match against deal names.")
     p.add_argument("--stage", action="append")
     p.add_argument("--owner", action="append")
-    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--limit", type=positive_int, default=25)
     p.add_argument("--all", action="store_true", help="Follow pages to the server's cap.")
     p.set_defaults(func=cmd_deals_list)
     p = deals.add_parser("get", parents=[common])
@@ -373,14 +413,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("reps", parents=[common], help="Per-rep performance.")
     p.add_argument("--duration", required=True, help="Window; see `proshort filters`.")
-    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--limit", type=positive_int, default=10)
     p.set_defaults(func=cmd_reps)
 
     p = sub.add_parser("recordings", parents=[common], help="Call recordings.")
     p.add_argument("--shared", action="store_true", help="Recordings shared with you instead.")
     p.add_argument("--q")
     p.add_argument("--since", help="From this date, YYYY-MM-DD.")
-    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--limit", type=positive_int, default=25)
     p.add_argument("--all", action="store_true")
     p.set_defaults(func=cmd_recordings)
 
@@ -390,7 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("meetings", parents=[common], help="Your upcoming meetings.")
     p.add_argument("--include-ongoing", action="store_true")
-    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--limit", type=positive_int, default=10)
     p.set_defaults(func=cmd_meetings)
 
     return parser
