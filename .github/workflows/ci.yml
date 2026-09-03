@@ -1,0 +1,46 @@
+name: ci
+
+# A credential-handling tool customers install. The tests assert things like "a
+# hostile deal name cannot repaint the terminal" and "a mismatched state is never
+# redeemed" -- properties that are worth nothing if nobody notices them breaking.
+on:
+  pull_request:
+  push:
+    branches: [main, staging]
+
+jobs:
+  # Its own job, not a step inside the matrix. Lint results do not vary by OS or
+  # interpreter, so running it four times told us the same thing four times --
+  # and, worse, reported a single lint finding as "test (macos-latest, 3.11)
+  # failed", which points a reader at a platform problem that does not exist.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # `ruff` is pinned in pyproject.toml. Its *default* rule set widens between
+      # minor versions -- 0.16 added rules that 0.15 did not have -- so an
+      # unpinned linter turns "somebody wrote something" into "a tool moved" and
+      # breaks a build on code that has not changed. The rule families are
+      # declared there too, for the same reason.
+      - run: python -m ruff check src tests
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both supported platforms, because the refresh lock is POSIX-specific
+        # and the credential file's permissions are checked by a real stat().
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q
