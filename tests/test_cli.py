@@ -261,3 +261,28 @@ def test_no_help_text_points_at_an_endpoint_that_cannot_answer():
         text = buffer.getvalue()
         if "filters" in text:
             assert "duration" not in text.split("filters")[0][-120:], text
+
+
+def test_the_readme_documents_every_command_and_no_others():
+    """The README's command table is the first thing a new person reads.
+
+    A table that lists a command the parser does not have sends someone to a
+    usage error on their first five minutes; one that omits a command hides it
+    forever. Both are the kind of drift nothing else here would catch, because
+    documentation has no tests unless it is given one.
+    """
+    import pathlib
+    import re
+
+    readme = pathlib.Path(__file__).resolve().parent.parent / "README.md"
+    documented = {
+        row.split()[0]
+        for row in re.findall(r"^\| `proshort ([a-z ]+?)(?: [-<].*)?` \|", readme.read_text(), re.M)
+    }
+    parser = cli.build_parser()
+    actual = {
+        name
+        for action in parser._subparsers._group_actions
+        for name in action.choices
+    }
+    assert documented == actual, f"README and parser disagree: {documented ^ actual}"

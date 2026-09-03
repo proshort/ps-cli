@@ -50,6 +50,74 @@ so the sentence above is true of a default install. On a machine with no keyring
 backend (a container, a CI runner) they fall back to
 `~/.proshort/<profile>.json` at mode `0600`, and `login` says so.
 
+## Your first five minutes
+
+```bash
+# 1. Install. `proshort` lands on your PATH.
+uv tool install git+https://github.com/proshort/ps-cli
+
+# 2. Sign in. Opens your browser; you approve what is shared.
+proshort login --url https://<your-proshort-host>
+
+# 3. Check it worked.
+proshort whoami
+```
+
+`whoami` prints who the session belongs to and which permissions it holds. If it
+says `Not signed in`, step 2 did not finish.
+
+Then the thing most people actually want:
+
+```bash
+proshort deals list --type ACTIVE --limit 10
+```
+
+Ask your Proshort administrator for the host in step 2 — there is deliberately no
+default, because a wrong one fails as "Proshort is unavailable", which is true of
+nothing and impossible to diagnose from the outside. You pass it once; it is
+remembered per profile.
+
+Ids flow between commands, which is most of how you use this:
+
+```bash
+id=$(proshort deals list --limit 1 --json | jq -r '.data[0].id')
+proshort deals get "$id" --json          # everything known about that deal
+proshort activities --deal "$id" --json  # its timeline
+```
+
+## Commands
+
+Ten, one per endpoint. Every one is read-only — there is nothing here that writes
+to Proshort.
+
+| Command | What it gives you |
+| --- | --- |
+| `proshort login` | Sign in through the browser |
+| `proshort logout` | Revoke the session server-side, then forget it |
+| `proshort whoami` | Who this session is, and what it may read |
+| `proshort filters` | Filter values you are allowed to filter by |
+| `proshort deals list` | Deals from the CRM pipeline |
+| `proshort deals get <deal_id>` | Everything known about one deal |
+| `proshort activities --deal <id>` | Activity timeline, up to 25 deals at once |
+| `proshort reps --duration <window>` | Aggregated per-rep performance |
+| `proshort recordings` | Your call recordings (`--shared` for others') |
+| `proshort calls <document_id>...` | AI summaries of recorded calls |
+| `proshort meetings` | Your upcoming meetings |
+
+Per-command flags are in `proshort <command> --help`. The ones that apply
+everywhere: `--json`, `--ndjson`, `--profile`, `--timeout`, `--verbose`.
+
+Worth knowing up front:
+
+- **`--limit` is the page size, not a total.** `--all --limit 10` fetches every
+  page, ten rows at a time.
+- **`--all` exists only on `deals list` and `recordings`** — the two endpoints
+  that page.
+- **`--duration` takes one of eight fixed windows**, listed in
+  `proshort reps --help`. It is not something `proshort filters` supplies.
+- **`--profile`** keeps separate sessions side by side, which is how you hold a
+  staging and a production login at once.
+
 ## Signing in
 
 There is no default API address: pass `--url` once, or set `PROSHORT_URL`. It is
