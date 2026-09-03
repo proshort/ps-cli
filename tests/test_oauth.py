@@ -396,3 +396,31 @@ def test_a_200_that_cannot_be_read_is_the_servers_fault_too(monkeypatch, body):
     with pytest.raises(CliError) as caught:
         oauth.refresh(base_url="https://example.invalid", client_id="c", refresh_token="r")
     assert caught.value.code == EXIT_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://host/v1", "https://host/", "https://host?x=1", "https://host#frag", "https://host/a/b"],
+)
+def test_a_url_with_anything_after_the_host_is_refused_or_reduced(url):
+    """Every caller concatenates onto this, so it has to be an origin.
+
+    `https://host/v1` built `/v1/v1/deals`; `https://host?x=1` built
+    `https://host?x=1/authorize?...`. The first `login` then stored the string, so
+    every later command inherited it and failed as "Proshort is unavailable" --
+    the undiagnosable-from-outside failure that got the internal default removed.
+    """
+    if url.rstrip("/") == "https://host":
+        assert oauth.as_origin(url) == "https://host"
+        return
+    with pytest.raises(CliError) as caught:
+        oauth.as_origin(url)
+    assert caught.value.code == EXIT_USAGE
+    assert "must be a host" in str(caught.value)
+    assert "no path" in (caught.value.hint or "")
+
+
+def test_a_plain_origin_survives_untouched():
+    assert oauth.as_origin("https://mcp.example.com") == "https://mcp.example.com"
+    assert oauth.as_origin("https://mcp.example.com:8443") == "https://mcp.example.com:8443"
+    assert oauth.as_origin("http://127.0.0.1:9400") == "http://127.0.0.1:9400"

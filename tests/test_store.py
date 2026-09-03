@@ -403,3 +403,71 @@ def test_a_scopes_list_of_non_strings_is_treated_as_corrupt(tmp_path, monkeypatc
     blob["scopes"] = [1, 2]
     store.path.write_text(json.dumps(blob), encoding="utf-8")
     assert store.load() is None
+
+
+def test_a_corrupt_file_does_not_fall_back_to_a_stale_keychain(tmp_path, monkeypatch):
+    """The direction the existing corrupt-copy test did not cover.
+
+    A file exists only because a keychain write failed after it, so the keychain
+    holds something *older*. Falling through to it when the file will not parse
+    hands back the spent refresh token -- and the server does exactly what it was
+    designed to do about one of those. `_parse` says a corrupt copy costs a
+    sign-in; falling back costs the whole grant.
+    """
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    ring = _LockableRing()
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: ring)
+    store = CredentialStore("test")
+
+    store.save(_creds(refresh_token="rt_spent"))
+    ring.locked = True
+    store.save(_creds(refresh_token="rt_current"))
+    ring.locked = False
+
+    for damaged in ("{truncated", "", "null", '"a string"', "[]"):
+        store.path.write_text(damaged, encoding="utf-8")
+        assert store.load() is None, f"handed back a stale pair for {damaged!r}"
+
+
+def test_the_higher_generation_wins_when_both_stores_parse(tmp_path, monkeypatch):
+    """The docstring promised this and the code had stopped doing it.
+
+    `load` was rewritten for the unreadable-keychain case and lost the comparison
+    entirely, while the paragraph explaining `generation` stayed. A comment
+    asserting a property the code does not have is worse than no comment.
+    """
+    monkeypatch.setenv("PROSHORT_CONFIG_DIR", str(tmp_path))
+    ring = _LockableRing()
+    monkeypatch.setattr(CredentialStore, "_keyring", lambda self: ring)
+    store = CredentialStore("test")
+
+    # A keychain copy that is genuinely newer than the file beside it. The file
+    # only comes into existence when the keychain write fails, which is the state
+    # this comparison exists for.
+    ring.locked = True
+    store.save(_creds(refresh_token="rt_file"))
+    ring.locked = False
+    file_generation = json.loads(store.path.read_text())["generation"]
+    ring.stored["test"] = json.dumps(
+        asdict(_creds(refresh_token="rt_keychain")) | {"generation": file_generation + 1}
+    )
+    assert store.load().refresh_token == "rt_keychain"
+
+    # And the file still takes a tie, because a locked keychain can hide the
+    # number `_next_generation` needed to beat.
+    ring.stored["test"] = json.dumps(
+        asdict(_creds(refresh_token="rt_keychain")) | {"generation": file_generation}
+    )
+    assert store.load().refresh_token == "rt_file"
+
+
+def test_a_blob_from_a_newer_cli_is_not_read_as_signed_out(tmp_path, monkeypatch):
+    """`Credentials(**data)` raises on an *extra* key, so a field added later --
+    or written by a newer build -- reported the user as signed out. Cheap now;
+    expensive after the first upgrade-then-downgrade."""
+    store = _store(tmp_path, monkeypatch)
+    store.save(_creds(refresh_token="rt_x"))
+    blob = asdict(_creds(refresh_token="rt_x")) | {"device_binding": "something-new"}
+    store.path.write_text(json.dumps(blob), encoding="utf-8")
+    loaded = store.load()
+    assert loaded is not None and loaded.refresh_token == "rt_x"

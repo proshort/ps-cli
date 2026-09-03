@@ -128,10 +128,10 @@ def cmd_login(args) -> int:
             EXIT_USAGE,
             hint=f"Pass --url https://<your-proshort-host>, or set {BASE_URL_ENV}.",
         )
-    base_url = base_url.rstrip("/")
-    # Checked here, before the browser opens, so a bad address is a usage error
-    # rather than a failed sign-in the user has to interpret.
-    oauth.require_secure(base_url)
+    # Reduced to an origin here, before the browser opens, so a bad address is a
+    # usage error rather than a failed sign-in the user has to interpret -- and
+    # so the *stored* value is one every later command can concatenate onto.
+    base_url = oauth.as_origin(base_url)
     payload = oauth.login(
         base_url=base_url,
         client_id=args.client_id,
@@ -241,10 +241,10 @@ def cmd_logout(args) -> int:
 
 
 def cmd_whoami(args) -> int:
-    body = Client(
-        CredentialStore(args.profile),
-        timeout=DEFAULT_TIMEOUT if args.timeout is None else args.timeout,
-    ).get("/v1/me")
+    # Through `_client` like every other command. Built by hand, it dropped
+    # `--verbose`, so rate-limit waits were silent on the one command a Skill is
+    # told to run first.
+    body = _client(args).get("/v1/me")
     return _emit(args, body, table=None, single=True)
 
 

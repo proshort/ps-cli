@@ -653,3 +653,89 @@ def test_an_unclassified_failure_is_still_exit_one(client, monkeypatch):
     with pytest.raises(CliError) as caught:
         client.get("/v1/deals")
     assert caught.value.code == EXIT_ERROR
+
+
+def test_a_wait_that_exactly_consumes_the_budget_is_still_a_rate_limit(client, monkeypatch):
+    """The guard used `>`, so a wait equal to the remaining budget was slept
+    through -- after which `_remaining()` raised "gave up after Ns" at exit 6, and
+    a Skill said Proshort was down about a server that had told it exactly how
+    long to back off. The tests covered 9999s and 2s; not the last second."""
+    slept: list[float] = []
+    monkeypatch.setattr(api.time, "sleep", slept.append)
+    # The clock is frozen so `now + wait` lands *exactly* on the deadline. Without
+    # that, microseconds elapse between setting it and comparing it, and the test
+    # passes under `>` as well -- which is how the boundary went untested.
+    monkeypatch.setattr(api.time, "monotonic", lambda: 1000.0)
+    _queue(monkeypatch, [_response(429, {}, {"Retry-After": "5"})])
+    client._deadline = 1005.0
+
+    with pytest.raises(CliError) as caught:
+        client.get("/v1/deals")
+    assert caught.value.code == EXIT_RATE_LIMIT
+    assert slept == [], "slept through the whole budget before giving up"
+
+
+def test_a_budget_spent_while_waiting_is_still_a_rate_limit(client, monkeypatch):
+    """Re-checked after the sleep, because the budget can be gone by then for
+    reasons that have nothing to do with this wait."""
+    def burn(_seconds):
+        client._deadline = time.monotonic() - 1
+
+    monkeypatch.setattr(api.time, "sleep", burn)
+    _queue(monkeypatch, [_response(429, {}, {"Retry-After": "1"}), _response(200, {})])
+    with pytest.raises(CliError) as caught:
+        client.get("/v1/deals")
+    assert caught.value.code == EXIT_RATE_LIMIT
+
+
+def test_a_unicode_content_length_does_not_traceback(client, monkeypatch):
+    """`"²".isdigit()` is True and `int("²")` raises -- a traceback and exit 1,
+    off the contract, from exactly the hostile or broken header this ceiling
+    exists to survive."""
+    # Built from bytes, the way httpx builds them off the wire: a str with a
+    # non-ASCII character is refused at construction, but `b"\xb2"` decodes to
+    # `"²"` through httpx's latin-1 fallback, so a server really can send this.
+    class _Odd:
+        status_code = 200
+        headers = httpx.Headers([(b"content-length", b"\xb2")])
+
+        def iter_bytes(self, chunk_size=None):
+            yield b'{"data": []}'
+
+    monkeypatch.setattr(api.httpx, "stream", lambda *_a, **_k: _Streamed(_Odd()))
+    assert client.get("/v1/deals") == {"data": []}
+
+
+def test_the_walk_stops_when_the_reported_total_is_reached(client, monkeypatch):
+    """`len(rows) < page_size` trusts the server's own claim about the size it
+    sent, and a page reported larger than it was ends the walk early with exit 0
+    and a short list. `total` is independent of that claim."""
+    pages = _queue(
+        monkeypatch,
+        [
+            _response(200, {"data": [{"id": 1}, {"id": 2}], "page": {"page_size": 2, "total": 4}}),
+            _response(200, {"data": [{"id": 3}, {"id": 4}], "page": {"page_size": 2, "total": 4}}),
+            _response(500, {}),
+        ],
+    )
+    body = client.get_all("/v1/deals", [])
+    assert [row["id"] for row in body["data"]] == [1, 2, 3, 4]
+    assert len(pages) == 2, "kept paging past the reported total"
+
+
+def test_whoami_keeps_verbose(monkeypatch):
+    """It built its `Client` by hand and dropped `--verbose`, so rate-limit waits
+    were silent on the one command a Skill is told to run first."""
+    from proshort_cli import cli
+
+    seen = {}
+    monkeypatch.setattr(cli, "Client", lambda store, **kwargs: seen.update(kwargs) or _Boom())
+    args = cli.build_parser().parse_args(["whoami", "--verbose"])
+    with pytest.raises(CliError):
+        cli.cmd_whoami(args)
+    assert seen.get("verbose") is True
+
+
+class _Boom:
+    def get(self, *_a, **_k):
+        raise CliError("stop here", EXIT_ERROR)

@@ -239,6 +239,33 @@ def _serve_until_callback(server: http.server.HTTPServer, timeout: float) -> dic
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
+def as_origin(base_url: str) -> str:
+    """Reduce a caller-supplied address to `scheme://host[:port]`, or refuse it.
+
+    Every caller concatenates onto this (`{base}/authorize`, `{base}/v1/deals`),
+    so it has to be an origin and not a prefix. `require_secure` checked the
+    scheme and the host and let the rest through, which meant
+    `https://host/v1` built `/v1/v1/deals`, `https://host?x=1` built
+    `https://host?x=1/authorize?...`, and a fragment swallowed the path glued
+    after it. The first `login` then *stored* that string, so every later command
+    inherited it and failed as "Proshort is unavailable" or a bare 404 -- the
+    undiagnosable-from-outside failure that got the internal default removed.
+
+    Refused rather than trimmed. Silently dropping a path somebody typed is the
+    same "answer a different question" this client refuses everywhere else, and
+    the one thing a wrong host must not do is look like it worked.
+    """
+    require_secure(base_url)
+    parts = urllib.parse.urlsplit(base_url)
+    if parts.path.strip("/") or parts.query or parts.fragment:
+        raise CliError(
+            f"--url must be a host, not a full address: got {base_url!r}.",
+            EXIT_USAGE,
+            hint="Pass the origin only, e.g. https://mcp.example.com -- no path, query or #fragment.",
+        )
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+
 def require_secure(base_url: str) -> None:
     """Refuse to send a grant over cleartext.
 

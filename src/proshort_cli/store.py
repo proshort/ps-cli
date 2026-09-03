@@ -160,13 +160,18 @@ class CredentialStore:
         # traceback several commands later. Same standard as `expires_at`.
         if not all(isinstance(scope, str) for scope in data["scopes"]):
             return None
+        # Filtered, not passed straight in. `Credentials(**data)` raises on an
+        # *extra* key, so a blob written by a newer CLI -- or carrying a field
+        # added later -- made this version report the user as signed out. Cheap
+        # now; expensive after the first upgrade-then-downgrade.
+        known = {name: data[name] for name in _FIELD_TYPES if name in data}
         try:
-            return Credentials(**data)
+            return Credentials(**known)
         except TypeError:
             return None
 
     def load(self) -> Credentials | None:
-        """Whichever store holds the *newer* pair, not whichever we look at first.
+        """The newest pair either store holds, or nothing, or a refusal to guess.
 
         Preferring the keychain unconditionally is what made a failed keychain
         write catastrophic rather than merely inconvenient. The sequence, on a
@@ -180,39 +185,48 @@ class CredentialStore:
            to do about a spent refresh token and revokes the whole family.
 
         The refresh lock cannot help: both processes agree on the same stale
-        keychain value. Two stores only work if one of them is authoritative.
+        keychain value. Two stores only work if one of them is authoritative, and
+        four rules decide which, in this order:
 
-        **`generation`, not `expires_at`.** The first version of this compared
-        expiry, on the reasoning that a refresh sets it from the clock so the
-        later one must be the newer pair. That is a coincidence, not an
-        invariant: `expires_at` answers "when does this access token die", and
-        the two only move together when every refresh happens near expiry and
-        `expires_in` never changes. Step the clock backwards between two saves,
-        or shorten `expires_in`, and the *newer* pair carries the *smaller*
-        number.
-
-        **An unreadable keychain is not an empty one.** On the happy path a
-        successful keychain write deletes the file, so the keychain is the only
-        copy -- and treating "locked" as "nothing stored" reported a signed-in
-        user as signed out, which sent them to `proshort login` to fix a keychain
-        problem. Three cases now:
-
-        - **File present.** Use it, whatever the keychain says or cannot say. A
-          file only exists because a keychain write failed after it, and a later
-          successful one would have deleted it, so the file is always the newest
-          thing on disk.
-        - **No file, keychain readable.** Its answer is the whole answer,
-          including `None` for genuinely signed out.
-        - **No file, keychain unreadable.** We cannot tell, and saying either
-          thing would be a guess. Raised, not returned.
+        - **A file that exists but does not parse means nothing is returned.**
+          The file only exists because a keychain write failed after it, so the
+          keychain holds something *older* -- and falling through to it hands
+          back the pair step 4 revokes the grant for. A corrupt copy costs a
+          sign-in; it must never cost the grant. This is the rule the previous
+          version was missing: it fell through, and the test it had covered the
+          opposite direction (corrupt keychain, good file).
+        - **Both parse: the higher `generation` wins**, with the file taking a
+          tie. `expires_at` was the first attempt and is a coincidence rather
+          than an invariant -- it answers "when does this access token die", and
+          a clock stepped backwards or a shortened `expires_in` puts the smaller
+          number on the newer pair. A counter has no clock in it.
+        - **Only one parses:** that one.
+        - **Neither, and the keychain could not even be read:** raised, not
+          returned. On the happy path a successful keychain write deletes the
+          file, so the keychain is the only copy, and reporting "locked" as
+          "signed out" sent a signed-in user to `proshort login` to fix a
+          keychain problem.
         """
-        file_copy = self._parse(self._read_file())
+        file_raw = self._read_file()
+        file_copy = self._parse(file_raw)
+        if file_raw is not None and file_copy is None:
+            return None
+
+        keychain_raw, readable = self._from_keyring()
+        keychain_copy = self._parse(keychain_raw)
+
+        if file_copy is not None and keychain_copy is not None:
+            # The file wins a tie: `save` writes it only when the keychain write
+            # failed, and a locked keychain is unreadable as well as unwritable,
+            # so `_next_generation` can land on the same number it could not see.
+            if keychain_copy.generation > file_copy.generation:
+                return keychain_copy
+            return file_copy
         if file_copy is not None:
             return file_copy
-        raw, readable = self._from_keyring()
         if not readable:
             raise KeychainUnavailable()
-        return self._parse(raw)
+        return keychain_copy
 
     def _read_file(self) -> str | None:
         return self._path.read_text(encoding="utf-8") if self._path.exists() else None

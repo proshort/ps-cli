@@ -171,11 +171,19 @@ class Client:
 
             if response.status_code == 429:
                 wait = _retry_after(response)
-                if time.monotonic() + wait > self._deadline:
+                # `>=`, not `>`. A wait that exactly consumes the budget used to
+                # be slept through, after which `_remaining()` raised "gave up
+                # after Ns" -- exit 6, so a Skill said Proshort was down about a
+                # server that had told it precisely how long to back off.
+                if time.monotonic() + wait >= self._deadline:
                     raise RateLimited(wait)
                 if self._verbose:
                     note(f"rate limited; waiting {wait}s")
                 time.sleep(wait)
+                # Re-checked after sleeping, because the budget can be gone by
+                # now for reasons that have nothing to do with this wait.
+                if time.monotonic() >= self._deadline:
+                    raise RateLimited(wait)
                 continue
 
             return self._interpret(response, body)
@@ -214,7 +222,16 @@ class Client:
                 follow_redirects=False,
             ) as response:
                 declared = response.headers.get("Content-Length")
-                if declared and declared.isdigit() and int(declared) > MAX_RESPONSE_BYTES:
+                # `isascii()` as well as `isdigit()`. `"²".isdigit()` is True and
+                # `int("²")` raises -- a traceback and exit 1, off the contract,
+                # from exactly the hostile or broken header this ceiling exists
+                # to survive.
+                if (
+                    declared
+                    and declared.isascii()
+                    and declared.isdigit()
+                    and int(declared) > MAX_RESPONSE_BYTES
+                ):
                     raise Unavailable("Proshort returned an unexpectedly large response.")
                 body = bytearray()
                 for chunk in response.iter_bytes():
@@ -322,6 +339,16 @@ class Client:
                 raise Unavailable("Proshort returned a page this client could not read.")
             merged.extend(rows)
             if not rows or len(rows) < _page_size(body):
+                break
+            # A second terminator where the server reports one. `len(rows) <
+            # page_size` is the only signal otherwise, and it trusts the server's
+            # own claim about the size it sent -- a page reported larger than it
+            # was ends the walk early and exits 0 with a short list, which is the
+            # silent truncation this command exists to prevent. `total` is
+            # independent of that claim. The real fix is a `has_more` flag on the
+            # other side; until then, two weak signals beat one.
+            total = (body.get("page") or {}).get("total")
+            if isinstance(total, int) and not isinstance(total, bool) and len(merged) >= total:
                 break
             if page >= MAX_PAGES:
                 raise Unavailable(

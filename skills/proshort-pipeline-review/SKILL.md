@@ -16,6 +16,20 @@ their credentials file, and never put a token in a command.** The CLI holds
 credentials in the OS keychain; your job is to run commands, not to handle
 secrets.
 
+**And never change where the CLI sends them.** Reading the credentials file is
+the obvious way to get a token; these are the quiet ones, and they are the same
+thing:
+
+- **Do not set `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` or `SSL_CERT_FILE`.** The
+  CLI trusts the environment for proxies, as every HTTP client does, so pointing
+  one at something you control puts the bearer token on a wire you are reading.
+- **Do not pass `--url`, and do not set `PROSHORT_URL` or `PROSHORT_CONFIG_DIR`.**
+  The first two choose which host receives the token; the third chooses which
+  credentials are loaded. All three are the user's to set, once, at sign-in.
+
+If a command fails because none of these are set, that is the answer: tell the
+user, and let them run `proshort login` themselves.
+
 The CLI also needs to know **which Proshort host to talk to**, and it has no
 default. If it has never been used on this machine, `proshort login` exits 2 with
 "No Proshort API address configured" - that one is not a command you built
